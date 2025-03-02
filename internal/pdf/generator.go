@@ -2,8 +2,9 @@ package pdf
 
 import (
 	"fmt"
+	"os"
+	"strings"
 
-	"github.com/jung-kurt/gofpdf"
 	"github.com/yugo-ibuki/docrawl/internal/crawler"
 )
 
@@ -19,124 +20,76 @@ func NewGenerator(outputPath string) *Generator {
 	}
 }
 
-// GeneratePDF はクロールしたページからPDFを生成する
+// GeneratePDF はクロールしたページからPDFを生成する（今回はテキストファイルに変更）
 func (g *Generator) GeneratePDF(pages []crawler.Page) error {
 	if len(pages) == 0 {
-		return fmt.Errorf("PDFを生成するページがありません")
+		return fmt.Errorf("生成するページがありません")
 	}
 
-	// PDFを作成
-	pdf := gofpdf.New("P", "mm", "A4", "")
+	// テキストファイルの出力パスを設定
+	txtOutputPath := getTextPath(g.outputPath)
 
-	// フォントを設定
-	pdf.AddUTF8Font("NotoSans", "", "")
-	pdf.SetFont("NotoSans", "", 11)
-
-	// 各ページについて
-	for _, page := range pages {
-		// 新しいPDFページを追加
-		pdf.AddPage()
-
-		// ヘッダー: ページタイトルとURL
-		pdf.SetFont("NotoSans", "B", 16)
-		pdf.CellFormat(190, 10, page.Title, "0", 1, "C", false, 0, "")
-
-		pdf.SetFont("NotoSans", "I", 8)
-		pdf.CellFormat(190, 5, page.URL, "0", 1, "C", false, 0, "")
-
-		pdf.Ln(10)
-
-		// 本文
-		pdf.SetFont("NotoSans", "", 11)
-		cleanText := cleanTextForPDF(page.Content)
-
-		// テキストの分割と改行処理
-		lines := splitTextIntoLines(cleanText, 80)
-		for _, line := range lines {
-			if line == "" {
-				pdf.Ln(5) // 空行の場合は行間を空ける
-			} else {
-				pdf.MultiCell(190, 5, line, "0", "L", false)
-			}
-		}
-
-		// ページ番号
-		pdf.SetY(-15)
-		pdf.SetFont("NotoSans", "I", 8)
-		pageNum := fmt.Sprintf("%d / %d", pdf.PageNo(), len(pages))
-		pdf.CellFormat(0, 10, pageNum, "0", 0, "C", false, 0, "")
+	// テキストファイルを生成
+	err := generateTextFile(pages, txtOutputPath)
+	if err != nil {
+		return err
 	}
 
-	// PDFを保存
-	return pdf.OutputFileAndClose(g.outputPath)
+	fmt.Printf("成功: %s が生成されました\n", txtOutputPath)
+	return nil
 }
 
-// cleanTextForPDF はPDFに表示するテキストをクリーンアップする
-func cleanTextForPDF(text string) string {
-	// HTMLタグの簡易的な除去（より高度な処理が必要な場合はHTMLパーサーを使用）
-	inTag := false
-	var result []rune
-
-	for _, r := range text {
-		if r == '<' {
-			inTag = true
-			continue
-		}
-		if r == '>' {
-			inTag = false
-			// タグの後に空白を挿入
-			result = append(result, ' ')
-			continue
-		}
-		if !inTag {
-			result = append(result, r)
-		}
+// getTextPath はPDFのパスからテキストファイルのパスを生成する
+func getTextPath(pdfPath string) string {
+	// PDFの拡張子をTXTに変更
+	if strings.HasSuffix(strings.ToLower(pdfPath), ".pdf") {
+		return pdfPath[:len(pdfPath)-4] + ".txt"
 	}
-
-	return string(result)
+	// 拡張子がない場合や他の拡張子の場合はTXTを追加
+	return pdfPath + ".txt"
 }
 
-// splitTextIntoLines はテキストを行に分割する
-func splitTextIntoLines(text string, maxChars int) []string {
-	var lines []string
-	var currentLine string
+// generateTextFile はページの内容からテキストファイルを生成する
+func generateTextFile(pages []crawler.Page, outputPath string) error {
+	// テキストファイルを作成
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("テキストファイルの作成に失敗しました: %w", err)
+	}
+	defer file.Close()
 
-	for _, r := range text {
-		currentLine += string(r)
+	// ヘッダー情報を書き込み
+	fmt.Fprintf(file, "# ドキュメント収集結果\n")
+	fmt.Fprintf(file, "# 取得ページ数: %d\n\n", len(pages))
 
-		// 改行文字の処理
-		if r == '\n' {
-			lines = append(lines, currentLine[:len(currentLine)-1])
-			currentLine = ""
-			continue
-		}
+	// 各ページの内容を書き込み
+	for i, page := range pages {
+		fmt.Fprintf(file, "=== ページ %d/%d ===\n", i+1, len(pages))
+		fmt.Fprintf(file, "URL: %s\n", page.URL)
+		fmt.Fprintf(file, "タイトル: %s\n\n", page.Title)
 
-		// 行の長さが最大文字数に達した場合
-		if len(currentLine) >= maxChars {
-			// 空白を探して分割
-			lastSpace := -1
-			for i := len(currentLine) - 1; i >= 0; i-- {
-				if currentLine[i] == ' ' {
-					lastSpace = i
-					break
-				}
-			}
+		// コンテンツを整形して書き込み
+		content := cleanupContent(page.Content)
+		fmt.Fprintln(file, content)
 
-			if lastSpace > 0 {
-				lines = append(lines, currentLine[:lastSpace])
-				currentLine = currentLine[lastSpace+1:]
-			} else {
-				// 空白が見つからない場合は強制的に分割
-				lines = append(lines, currentLine)
-				currentLine = ""
-			}
+		// ページの区切り
+		if i < len(pages)-1 {
+			fmt.Fprintln(file, "\n"+strings.Repeat("-", 80)+"\n")
 		}
 	}
 
-	// 残りのテキストを追加
-	if currentLine != "" {
-		lines = append(lines, currentLine)
+	return nil
+}
+
+// cleanupContent はコンテンツを整形する
+func cleanupContent(content string) string {
+	// 連続する空白行を削除
+	for strings.Contains(content, "\n\n\n") {
+		content = strings.ReplaceAll(content, "\n\n\n", "\n\n")
 	}
 
-	return lines
+	// 先頭と末尾の空白を削除
+	content = strings.TrimSpace(content)
+
+	return content
 }

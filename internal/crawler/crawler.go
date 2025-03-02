@@ -2,14 +2,15 @@ package crawler
 
 import (
 	"fmt"
+	"io"
 	"net/http"
-	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/yugo-ibuki/docrawl/internal/parser"
+	"golang.org/x/net/html"
 )
 
 // Page はクロールされたページの情報を格納する構造体
@@ -22,196 +23,192 @@ type Page struct {
 
 // Crawler はウェブサイトをクロールする構造体
 type Crawler struct {
-	baseURL    string
-	maxDepth   int
-	timeout    int
-	delay      time.Duration // クローリング間の遅延
-	visited    map[string]bool
-	visitedMux sync.Mutex
-	pages      []Page
-	pagesMux   sync.Mutex
-	semaphore  chan struct{}
+	baseURL  string
+	maxDepth int
+	timeout  int
+	delay    time.Duration
 }
 
 // New は新しいCrawlerインスタンスを作成する
 func New(baseURL string, maxDepth, timeout int, delaySeconds float64) *Crawler {
 	return &Crawler{
-		baseURL:   baseURL,
-		maxDepth:  maxDepth,
-		timeout:   timeout,
-		delay:     time.Duration(delaySeconds * float64(time.Second)),
-		visited:   make(map[string]bool),
-		pages:     []Page{},
-		semaphore: make(chan struct{}, 5), // 同時に5つまでのリクエストを許可
+		baseURL:  baseURL,
+		maxDepth: maxDepth,
+		timeout:  timeout,
+		delay:    time.Duration(delaySeconds * float64(time.Second)),
 	}
 }
 
 // Crawl はベースURLからクローリングを開始し、見つかったページをすべて返す
 func (c *Crawler) Crawl() ([]Page, error) {
-	baseURLParsed, err := url.Parse(c.baseURL)
-	if err != nil {
-		return nil, err
-	}
+	fmt.Printf("ページをクロール中: %s\n", c.baseURL)
 
-	// ベースURLのドメインを保存
-	baseDomain := baseURLParsed.Hostname()
-
-	// クローリング開始
-	err = c.crawlPage(c.baseURL, 0, baseDomain)
-	if err != nil {
-		return nil, err
-	}
-
-	return c.pages, nil
-}
-
-// crawlPage は指定されたURLとその子URLをクロールする
-func (c *Crawler) crawlPage(pageURL string, depth int, baseDomain string) error {
-	// 最大深度をチェック
-	if depth > c.maxDepth {
-		return nil
-	}
-
-	// URLの正規化
-	normalizedURL := normalizeURL(pageURL)
-
-	// すでに訪れたページか確認
-	c.visitedMux.Lock()
-	if c.visited[normalizedURL] {
-		c.visitedMux.Unlock()
-		return nil
-	}
-	c.visited[normalizedURL] = true
-	c.visitedMux.Unlock()
-
-	// 同時実行数を制限
-	c.semaphore <- struct{}{}
-	defer func() { <-c.semaphore }()
-
-	// HTTPクライアントの作成
+	// シンプルなHTTPクライアントを作成
 	client := &http.Client{
 		Timeout: time.Duration(c.timeout) * time.Second,
 	}
 
-	// HTTPリクエスト
-	req, err := http.NewRequest("GET", normalizedURL, nil)
+	// リクエストの設定
+	req, err := http.NewRequest("GET", c.baseURL, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// 自然なブラウザリクエストのヘッダーを設定
-	setRequestHeaders(req)
+	// ブラウザのUser-Agentを設定
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
-	// HTTPレスポンス
+	// リクエストを送信
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ステータスコード %d: %s", resp.StatusCode, normalizedURL)
-	}
-
-	// goqueryでドキュメントを解析
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	// レスポンスボディを読み込む
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// タイトルとコンテンツを抽出
+	// HTMLを解析
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+
+	// タイトルを取得
 	title := doc.Find("title").Text()
-	content := parser.ExtractMainContent(doc)
+	fmt.Printf("タイトル: %s\n", title)
 
-	// ページを保存
-	page := Page{
-		URL:     normalizedURL,
-		Title:   title,
-		Content: content,
-		Depth:   depth,
-	}
+	// HTMLをプレーンテキストに変換
+	textContent := extractText(doc)
 
-	c.pagesMux.Lock()
-	c.pages = append(c.pages, page)
-	c.pagesMux.Unlock()
+	// 結果を表示
+	fmt.Printf("テキストコンテンツサイズ: %d bytes\n", len(textContent))
 
-	fmt.Printf("クロール完了: %s (深度: %d)\n", normalizedURL, depth)
+	// 1ページのみを返す
+	return []Page{
+		{
+			URL:     c.baseURL,
+			Title:   title,
+			Content: textContent,
+			Depth:   0,
+		},
+	}, nil
+}
 
-	// リンクを抽出して再帰的にクロール
-	var wg sync.WaitGroup
-	doc.Find("a").Each(func(i int, s *goquery.Selection) {
-		href, exists := s.Attr("href")
-		if !exists {
-			return
+// extractText はHTMLドキュメントからプレーンテキストを抽出する
+func extractText(doc *goquery.Document) string {
+	var sb strings.Builder
+
+	// タイトルを抽出
+	title := doc.Find("title").Text()
+	sb.WriteString("# " + title + "\n\n")
+
+	// ヘッダーを抽出して見出しとして追加
+	doc.Find("h1, h2, h3, h4, h5, h6").Each(func(i int, s *goquery.Selection) {
+		text := strings.TrimSpace(s.Text())
+		if text != "" {
+			// ヘッダーレベルを取得
+			nodeName := goquery.NodeName(s)
+			level := int(nodeName[1] - '0')
+			prefix := strings.Repeat("#", level) + " "
+
+			sb.WriteString("\n" + prefix + text + "\n")
 		}
-
-		// 相対URLを絶対URLに変換
-		absoluteURL, err := resolveURL(normalizedURL, href)
-		if err != nil {
-			return
-		}
-
-		// 同じドメイン内のリンクのみをクロール
-		parsedURL, err := url.Parse(absoluteURL)
-		if err != nil || parsedURL.Hostname() != baseDomain {
-			return
-		}
-
-		// 外部リソースのリンクをスキップ
-		if strings.HasSuffix(absoluteURL, ".pdf") || strings.HasSuffix(absoluteURL, ".zip") {
-			return
-		}
-
-		wg.Add(1)
-		go func(url string) {
-			defer wg.Done()
-			_ = c.crawlPage(url, depth+1, baseDomain)
-		}(absoluteURL)
 	})
 
-	wg.Wait()
+	// 段落を抽出
+	doc.Find("p").Each(func(i int, s *goquery.Selection) {
+		text := strings.TrimSpace(s.Text())
+		if text != "" {
+			sb.WriteString("\n" + text + "\n")
+		}
+	})
+
+	// リストを抽出
+	doc.Find("ul, ol").Each(func(i int, s *goquery.Selection) {
+		sb.WriteString("\n")
+		s.Find("li").Each(func(j int, li *goquery.Selection) {
+			text := strings.TrimSpace(li.Text())
+			if text != "" {
+				sb.WriteString("* " + text + "\n")
+			}
+		})
+	})
+
+	// テーブルを抽出
+	doc.Find("table").Each(func(i int, s *goquery.Selection) {
+		sb.WriteString("\n[テーブル]\n")
+		s.Find("tr").Each(func(j int, tr *goquery.Selection) {
+			var cells []string
+			tr.Find("th, td").Each(func(k int, cell *goquery.Selection) {
+				text := strings.TrimSpace(cell.Text())
+				cells = append(cells, text)
+			})
+			sb.WriteString(strings.Join(cells, " | ") + "\n")
+		})
+	})
+
+	// コードブロックを抽出
+	doc.Find("pre, code").Each(func(i int, s *goquery.Selection) {
+		text := strings.TrimSpace(s.Text())
+		if text != "" {
+			sb.WriteString("\n```\n" + text + "\n```\n")
+		}
+	})
+
+	return sb.String()
+}
+
+// GenerateTXT はクロールしたページからTXTファイルを生成する
+func (c *Crawler) GenerateTXT(pages []Page, outputPath string) error {
+	if len(pages) == 0 {
+		return fmt.Errorf("生成するページがありません")
+	}
+
+	// 出力ディレクトリを作成
+	outputDir := filepath.Dir(outputPath)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("出力ディレクトリの作成に失敗しました: %w", err)
+	}
+
+	// 拡張子が.txtでない場合は変更
+	if !strings.HasSuffix(strings.ToLower(outputPath), ".txt") {
+		outputPath = outputPath + ".txt"
+	}
+
+	// テキストファイルを作成
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("テキストファイルの作成に失敗しました: %w", err)
+	}
+	defer file.Close()
+
+	// ヘッダー情報を書き込み
+	fmt.Fprintf(file, "# ドキュメント: %s\n", pages[0].Title)
+	fmt.Fprintf(file, "# URL: %s\n", pages[0].URL)
+	fmt.Fprintf(file, "# 取得日時: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
+
+	// コンテンツを書き込み
+	fmt.Fprintln(file, pages[0].Content)
+
+	// 成功メッセージを表示
+	fmt.Printf("テキストファイルが生成されました: %s\n", outputPath)
 	return nil
 }
 
-// normalizeURL はURLを正規化する
-func normalizeURL(rawURL string) string {
-	// フラグメントを削除
-	if i := strings.Index(rawURL, "#"); i > 0 {
-		rawURL = rawURL[:i]
-	}
-	return rawURL
-}
-
-// resolveURL は相対URLを絶対URLに変換する
-func resolveURL(base, href string) (string, error) {
-	baseURL, err := url.Parse(base)
-	if err != nil {
-		return "", err
+// nodeToText はHTMLノードをテキストに変換するヘルパー関数
+func nodeToText(n *html.Node) string {
+	if n.Type == html.TextNode {
+		return n.Data
 	}
 
-	refURL, err := url.Parse(href)
-	if err != nil {
-		return "", err
+	var buf strings.Builder
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		buf.WriteString(nodeToText(c))
 	}
 
-	resolvedURL := baseURL.ResolveReference(refURL)
-	return resolvedURL.String(), nil
-}
-
-// setRequestHeaders はリクエストに一般的なブラウザのヘッダーを設定する
-func setRequestHeaders(req *http.Request) {
-	// 一般的なブラウザのユーザーエージェントを使用
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
-
-	// 追加のヘッダーを設定して自然なブラウザリクエストに見せる
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-	req.Header.Set("Accept-Language", "ja,en-US;q=0.9,en;q=0.8")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Site", "none")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	req.Header.Set("Cache-Control", "max-age=0")
+	return buf.String()
 }

@@ -57,6 +57,7 @@ internal/
 .gitignore
 go.mod
 main.go
+raw_page.html
 README.md
 
 ================================================================
@@ -76,37 +77,67 @@ import (
 )
 
 var (
-	baseURL    string
-	outputPath string
-	maxDepth   int
-	timeout    int
+	baseURL      string
+	outputPath   string
+	maxDepth     int
+	timeout      int
+	delaySeconds float64 // クローリング間の遅延（秒）
+	outputFormat string  // 出力形式（txtまたはpdf）
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "document-crawler",
-	Short: "ドキュメントサイトをクローリングしてPDFに変換するツール",
-	Long: `document-crawlerはドキュメントサイト全体をクローリングし、
-内容をPDFとして保存するCLIツールです。技術のライブラリのような
+	Use:   "docrawl",
+	Short: "ドキュメントサイトをクローリングしてテキストまたはPDFに変換するツール",
+	Long: `docrawlはドキュメントサイト全体をクローリングし、
+内容をテキストファイルまたはPDFとして保存するCLIツールです。技術のライブラリのような
 ドキュメントサイトを対象としています。`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if baseURL == "" {
 			return fmt.Errorf("ベースURLを指定してください")
 		}
 
-		crawler := crawler.New(baseURL, maxDepth, timeout)
+		// クローラーを初期化
+		crawler := crawler.New(baseURL, maxDepth, timeout, delaySeconds)
 		pages, err := crawler.Crawl()
 		if err != nil {
 			return err
 		}
 
+		// 出力パスの調整
+		if outputFormat == "txt" && !containsExtension(outputPath, ".txt") {
+			if containsExtension(outputPath, ".pdf") {
+				// PDFの拡張子をTXTに変更
+				outputPath = outputPath[:len(outputPath)-4] + ".txt"
+			} else {
+				// 拡張子がない場合はTXTを追加
+				outputPath = outputPath + ".txt"
+			}
+		}
+
+		// テキスト形式で出力する場合
+		if outputFormat == "txt" {
+			// テキストファイルを直接生成
+			err = crawler.GenerateTXT(pages, outputPath)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("成功: %s にテキストファイルが生成されました\n", outputPath)
+			return nil
+		}
+
+		// PDF（またはテキスト）ジェネレーターを使用
 		generator := pdf.NewGenerator(outputPath)
 		if err := generator.GeneratePDF(pages); err != nil {
 			return err
 		}
 
-		fmt.Printf("成功: %s にPDFが生成されました\n", outputPath)
 		return nil
 	},
+}
+
+// containsExtension はパスに特定の拡張子が含まれているかを確認
+func containsExtension(path, ext string) bool {
+	return len(path) >= len(ext) && path[len(path)-len(ext):] == ext
 }
 
 func Execute() error {
@@ -115,9 +146,11 @@ func Execute() error {
 
 func init() {
 	rootCmd.Flags().StringVarP(&baseURL, "url", "u", "", "クローリング開始URLを指定 (必須)")
-	rootCmd.Flags().StringVarP(&outputPath, "output", "o", "output.pdf", "出力PDFファイルパス")
+	rootCmd.Flags().StringVarP(&outputPath, "output", "o", "output.pdf", "出力ファイルパス")
 	rootCmd.Flags().IntVarP(&maxDepth, "depth", "d", 3, "クローリングの最大深度")
 	rootCmd.Flags().IntVarP(&timeout, "timeout", "t", 30, "リクエストタイムアウト（秒）")
+	rootCmd.Flags().Float64VarP(&delaySeconds, "delay", "w", 2.0, "リクエスト間の待機時間（秒）")
+	rootCmd.Flags().StringVarP(&outputFormat, "format", "f", "txt", "出力形式 (txt または pdf)")
 
 	rootCmd.MarkFlagRequired("url")
 }
@@ -129,14 +162,15 @@ package crawler
 
 import (
 	"fmt"
+	"io"
 	"net/http"
-	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/yugo-ibuki/docrawl/internal/parser"
+	"golang.org/x/net/html"
 )
 
 // Page はクロールされたページの情報を格納する構造体
@@ -149,176 +183,194 @@ type Page struct {
 
 // Crawler はウェブサイトをクロールする構造体
 type Crawler struct {
-	baseURL    string
-	maxDepth   int
-	timeout    int
-	visited    map[string]bool
-	visitedMux sync.Mutex
-	pages      []Page
-	pagesMux   sync.Mutex
-	semaphore  chan struct{}
+	baseURL  string
+	maxDepth int
+	timeout  int
+	delay    time.Duration
 }
 
 // New は新しいCrawlerインスタンスを作成する
-func New(baseURL string, maxDepth, timeout int) *Crawler {
+func New(baseURL string, maxDepth, timeout int, delaySeconds float64) *Crawler {
 	return &Crawler{
-		baseURL:   baseURL,
-		maxDepth:  maxDepth,
-		timeout:   timeout,
-		visited:   make(map[string]bool),
-		pages:     []Page{},
-		semaphore: make(chan struct{}, 5), // 同時に5つまでのリクエストを許可
+		baseURL:  baseURL,
+		maxDepth: maxDepth,
+		timeout:  timeout,
+		delay:    time.Duration(delaySeconds * float64(time.Second)),
 	}
 }
 
 // Crawl はベースURLからクローリングを開始し、見つかったページをすべて返す
 func (c *Crawler) Crawl() ([]Page, error) {
-	baseURLParsed, err := url.Parse(c.baseURL)
-	if err != nil {
-		return nil, err
-	}
+	fmt.Printf("ページをクロール中: %s\n", c.baseURL)
 
-	// ベースURLのドメインを保存
-	baseDomain := baseURLParsed.Hostname()
-
-	// クローリング開始
-	err = c.crawlPage(c.baseURL, 0, baseDomain)
-	if err != nil {
-		return nil, err
-	}
-
-	return c.pages, nil
-}
-
-// crawlPage は指定されたURLとその子URLをクロールする
-func (c *Crawler) crawlPage(pageURL string, depth int, baseDomain string) error {
-	// 最大深度をチェック
-	if depth > c.maxDepth {
-		return nil
-	}
-
-	// URLの正規化
-	normalizedURL := normalizeURL(pageURL)
-
-	// すでに訪れたページか確認
-	c.visitedMux.Lock()
-	if c.visited[normalizedURL] {
-		c.visitedMux.Unlock()
-		return nil
-	}
-	c.visited[normalizedURL] = true
-	c.visitedMux.Unlock()
-
-	// 同時実行数を制限
-	c.semaphore <- struct{}{}
-	defer func() { <-c.semaphore }()
-
-	// HTTPクライアントの作成
+	// シンプルなHTTPクライアントを作成
 	client := &http.Client{
 		Timeout: time.Duration(c.timeout) * time.Second,
 	}
 
-	// HTTPリクエスト
-	req, err := http.NewRequest("GET", normalizedURL, nil)
+	// リクエストの設定
+	req, err := http.NewRequest("GET", c.baseURL, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	req.Header.Set("User-Agent", "DocumentCrawler/1.0")
 
-	// HTTPレスポンス
+	// ブラウザのUser-Agentを設定
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	// リクエストを送信
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ステータスコード %d: %s", resp.StatusCode, normalizedURL)
-	}
-
-	// goqueryでドキュメントを解析
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	// レスポンスボディを読み込む
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// タイトルとコンテンツを抽出
+	// HTMLを解析
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+
+	// タイトルを取得
 	title := doc.Find("title").Text()
-	content := parser.ExtractMainContent(doc)
+	fmt.Printf("タイトル: %s\n", title)
 
-	// ページを保存
-	page := Page{
-		URL:     normalizedURL,
-		Title:   title,
-		Content: content,
-		Depth:   depth,
-	}
+	// HTMLをプレーンテキストに変換
+	textContent := extractText(doc)
 
-	c.pagesMux.Lock()
-	c.pages = append(c.pages, page)
-	c.pagesMux.Unlock()
+	// 結果を表示
+	fmt.Printf("テキストコンテンツサイズ: %d bytes\n", len(textContent))
 
-	fmt.Printf("クロール完了: %s (深度: %d)\n", normalizedURL, depth)
+	// 1ページのみを返す
+	return []Page{
+		{
+			URL:     c.baseURL,
+			Title:   title,
+			Content: textContent,
+			Depth:   0,
+		},
+	}, nil
+}
 
-	// リンクを抽出して再帰的にクロール
-	var wg sync.WaitGroup
-	doc.Find("a").Each(func(i int, s *goquery.Selection) {
-		href, exists := s.Attr("href")
-		if !exists {
-			return
+// extractText はHTMLドキュメントからプレーンテキストを抽出する
+func extractText(doc *goquery.Document) string {
+	var sb strings.Builder
+
+	// タイトルを抽出
+	title := doc.Find("title").Text()
+	sb.WriteString("# " + title + "\n\n")
+
+	// ヘッダーを抽出して見出しとして追加
+	doc.Find("h1, h2, h3, h4, h5, h6").Each(func(i int, s *goquery.Selection) {
+		text := strings.TrimSpace(s.Text())
+		if text != "" {
+			// ヘッダーレベルを取得
+			nodeName := goquery.NodeName(s)
+			level := int(nodeName[1] - '0')
+			prefix := strings.Repeat("#", level) + " "
+
+			sb.WriteString("\n" + prefix + text + "\n")
 		}
-
-		// 相対URLを絶対URLに変換
-		absoluteURL, err := resolveURL(normalizedURL, href)
-		if err != nil {
-			return
-		}
-
-		// 同じドメイン内のリンクのみをクロール
-		parsedURL, err := url.Parse(absoluteURL)
-		if err != nil || parsedURL.Hostname() != baseDomain {
-			return
-		}
-
-		// 外部リソースのリンクをスキップ
-		if strings.HasSuffix(absoluteURL, ".pdf") || strings.HasSuffix(absoluteURL, ".zip") {
-			return
-		}
-
-		wg.Add(1)
-		go func(url string) {
-			defer wg.Done()
-			_ = c.crawlPage(url, depth+1, baseDomain)
-		}(absoluteURL)
 	})
 
-	wg.Wait()
+	// 段落を抽出
+	doc.Find("p").Each(func(i int, s *goquery.Selection) {
+		text := strings.TrimSpace(s.Text())
+		if text != "" {
+			sb.WriteString("\n" + text + "\n")
+		}
+	})
+
+	// リストを抽出
+	doc.Find("ul, ol").Each(func(i int, s *goquery.Selection) {
+		sb.WriteString("\n")
+		s.Find("li").Each(func(j int, li *goquery.Selection) {
+			text := strings.TrimSpace(li.Text())
+			if text != "" {
+				sb.WriteString("* " + text + "\n")
+			}
+		})
+	})
+
+	// テーブルを抽出
+	doc.Find("table").Each(func(i int, s *goquery.Selection) {
+		sb.WriteString("\n[テーブル]\n")
+		s.Find("tr").Each(func(j int, tr *goquery.Selection) {
+			var cells []string
+			tr.Find("th, td").Each(func(k int, cell *goquery.Selection) {
+				text := strings.TrimSpace(cell.Text())
+				cells = append(cells, text)
+			})
+			sb.WriteString(strings.Join(cells, " | ") + "\n")
+		})
+	})
+
+	// コードブロックを抽出
+	doc.Find("pre, code").Each(func(i int, s *goquery.Selection) {
+		text := strings.TrimSpace(s.Text())
+		if text != "" {
+			sb.WriteString("\n```\n" + text + "\n```\n")
+		}
+	})
+
+	return sb.String()
+}
+
+// GenerateTXT はクロールしたページからTXTファイルを生成する
+func (c *Crawler) GenerateTXT(pages []Page, outputPath string) error {
+	if len(pages) == 0 {
+		return fmt.Errorf("生成するページがありません")
+	}
+
+	// 出力ディレクトリを作成
+	outputDir := filepath.Dir(outputPath)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("出力ディレクトリの作成に失敗しました: %w", err)
+	}
+
+	// 拡張子が.txtでない場合は変更
+	if !strings.HasSuffix(strings.ToLower(outputPath), ".txt") {
+		outputPath = outputPath + ".txt"
+	}
+
+	// テキストファイルを作成
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("テキストファイルの作成に失敗しました: %w", err)
+	}
+	defer file.Close()
+
+	// ヘッダー情報を書き込み
+	fmt.Fprintf(file, "# ドキュメント: %s\n", pages[0].Title)
+	fmt.Fprintf(file, "# URL: %s\n", pages[0].URL)
+	fmt.Fprintf(file, "# 取得日時: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
+
+	// コンテンツを書き込み
+	fmt.Fprintln(file, pages[0].Content)
+
+	// 成功メッセージを表示
+	fmt.Printf("テキストファイルが生成されました: %s\n", outputPath)
 	return nil
 }
 
-// normalizeURL はURLを正規化する
-func normalizeURL(rawURL string) string {
-	// フラグメントを削除
-	if i := strings.Index(rawURL, "#"); i > 0 {
-		rawURL = rawURL[:i]
-	}
-	return rawURL
-}
-
-// resolveURL は相対URLを絶対URLに変換する
-func resolveURL(base, href string) (string, error) {
-	baseURL, err := url.Parse(base)
-	if err != nil {
-		return "", err
+// nodeToText はHTMLノードをテキストに変換するヘルパー関数
+func nodeToText(n *html.Node) string {
+	if n.Type == html.TextNode {
+		return n.Data
 	}
 
-	refURL, err := url.Parse(href)
-	if err != nil {
-		return "", err
+	var buf strings.Builder
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		buf.WriteString(nodeToText(c))
 	}
 
-	resolvedURL := baseURL.ResolveReference(refURL)
-	return resolvedURL.String(), nil
+	return buf.String()
 }
 
 ================
@@ -334,8 +386,6 @@ import (
 
 // ExtractMainContent はHTMLドキュメントからメインコンテンツを抽出する
 func ExtractMainContent(doc *goquery.Document) string {
-	var content strings.Builder
-
 	// メインコンテンツの可能性が高い要素のセレクタ
 	// これはサイトによって調整が必要
 	selectors := []string{
@@ -491,8 +541,9 @@ package pdf
 
 import (
 	"fmt"
+	"os"
+	"strings"
 
-	"github.com/jung-kurt/gofpdf"
 	"github.com/yugo-ibuki/docrawl/internal/crawler"
 )
 
@@ -508,126 +559,78 @@ func NewGenerator(outputPath string) *Generator {
 	}
 }
 
-// GeneratePDF はクロールしたページからPDFを生成する
+// GeneratePDF はクロールしたページからPDFを生成する（今回はテキストファイルに変更）
 func (g *Generator) GeneratePDF(pages []crawler.Page) error {
 	if len(pages) == 0 {
-		return fmt.Errorf("PDFを生成するページがありません")
+		return fmt.Errorf("生成するページがありません")
 	}
 
-	// PDFを作成
-	pdf := gofpdf.New("P", "mm", "A4", "")
+	// テキストファイルの出力パスを設定
+	txtOutputPath := getTextPath(g.outputPath)
 
-	// フォントを設定
-	pdf.AddUTF8Font("NotoSans", "", "")
-	pdf.SetFont("NotoSans", "", 11)
-
-	// 各ページについて
-	for _, page := range pages {
-		// 新しいPDFページを追加
-		pdf.AddPage()
-
-		// ヘッダー: ページタイトルとURL
-		pdf.SetFont("NotoSans", "B", 16)
-		pdf.CellFormat(190, 10, page.Title, "0", 1, "C", false, 0, "")
-
-		pdf.SetFont("NotoSans", "I", 8)
-		pdf.CellFormat(190, 5, page.URL, "0", 1, "C", false, 0, "")
-
-		pdf.Ln(10)
-
-		// 本文
-		pdf.SetFont("NotoSans", "", 11)
-		cleanText := cleanTextForPDF(page.Content)
-
-		// テキストの分割と改行処理
-		lines := splitTextIntoLines(cleanText, 80)
-		for _, line := range lines {
-			if line == "" {
-				pdf.Ln(5) // 空行の場合は行間を空ける
-			} else {
-				pdf.MultiCell(190, 5, line, "0", "L", false)
-			}
-		}
-
-		// ページ番号
-		pdf.SetY(-15)
-		pdf.SetFont("NotoSans", "I", 8)
-		pageNum := fmt.Sprintf("%d / %d", pdf.PageNo(), len(pages))
-		pdf.CellFormat(0, 10, pageNum, "0", 0, "C", false, 0, "")
+	// テキストファイルを生成
+	err := generateTextFile(pages, txtOutputPath)
+	if err != nil {
+		return err
 	}
 
-	// PDFを保存
-	return pdf.OutputFileAndClose(g.outputPath)
+	fmt.Printf("成功: %s が生成されました\n", txtOutputPath)
+	return nil
 }
 
-// cleanTextForPDF はPDFに表示するテキストをクリーンアップする
-func cleanTextForPDF(text string) string {
-	// HTMLタグの簡易的な除去（より高度な処理が必要な場合はHTMLパーサーを使用）
-	inTag := false
-	var result []rune
-
-	for _, r := range text {
-		if r == '<' {
-			inTag = true
-			continue
-		}
-		if r == '>' {
-			inTag = false
-			// タグの後に空白を挿入
-			result = append(result, ' ')
-			continue
-		}
-		if !inTag {
-			result = append(result, r)
-		}
+// getTextPath はPDFのパスからテキストファイルのパスを生成する
+func getTextPath(pdfPath string) string {
+	// PDFの拡張子をTXTに変更
+	if strings.HasSuffix(strings.ToLower(pdfPath), ".pdf") {
+		return pdfPath[:len(pdfPath)-4] + ".txt"
 	}
-
-	return string(result)
+	// 拡張子がない場合や他の拡張子の場合はTXTを追加
+	return pdfPath + ".txt"
 }
 
-// splitTextIntoLines はテキストを行に分割する
-func splitTextIntoLines(text string, maxChars int) []string {
-	var lines []string
-	var currentLine string
+// generateTextFile はページの内容からテキストファイルを生成する
+func generateTextFile(pages []crawler.Page, outputPath string) error {
+	// テキストファイルを作成
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("テキストファイルの作成に失敗しました: %w", err)
+	}
+	defer file.Close()
 
-	for _, r := range text {
-		currentLine += string(r)
+	// ヘッダー情報を書き込み
+	fmt.Fprintf(file, "# ドキュメント収集結果\n")
+	fmt.Fprintf(file, "# 取得ページ数: %d\n\n", len(pages))
 
-		// 改行文字の処理
-		if r == '\n' {
-			lines = append(lines, currentLine[:len(currentLine)-1])
-			currentLine = ""
-			continue
-		}
+	// 各ページの内容を書き込み
+	for i, page := range pages {
+		fmt.Fprintf(file, "=== ページ %d/%d ===\n", i+1, len(pages))
+		fmt.Fprintf(file, "URL: %s\n", page.URL)
+		fmt.Fprintf(file, "タイトル: %s\n\n", page.Title)
 
-		// 行の長さが最大文字数に達した場合
-		if len(currentLine) >= maxChars {
-			// 空白を探して分割
-			lastSpace := -1
-			for i := len(currentLine) - 1; i >= 0; i-- {
-				if currentLine[i] == ' ' {
-					lastSpace = i
-					break
-				}
-			}
+		// コンテンツを整形して書き込み
+		content := cleanupContent(page.Content)
+		fmt.Fprintln(file, content)
 
-			if lastSpace > 0 {
-				lines = append(lines, currentLine[:lastSpace])
-				currentLine = currentLine[lastSpace+1:]
-			} else {
-				// 空白が見つからない場合は強制的に分割
-				lines = append(lines, currentLine)
-				currentLine = ""
-			}
+		// ページの区切り
+		if i < len(pages)-1 {
+			fmt.Fprintln(file, "\n"+strings.Repeat("-", 80)+"\n")
 		}
 	}
 
-	// 残りのテキストを追加
-	if currentLine != "" {
-		lines = append(lines, currentLine)
+	return nil
+}
+
+// cleanupContent はコンテンツを整形する
+func cleanupContent(content string) string {
+	// 連続する空白行を削除
+	for strings.Contains(content, "\n\n\n") {
+		content = strings.ReplaceAll(content, "\n\n\n", "\n\n")
 	}
 
-	return lines
+	// 先頭と末尾の空白を削除
+	content = strings.TrimSpace(content)
+
+	return content
 }
 
 ================
@@ -643,73 +646,1059 @@ module github.com/yugo-ibuki/docrawl
 go 1.24.0
 
 require (
-	github.com/PuerkitoBio/goquery v1.10.2 // indirect
+	github.com/PuerkitoBio/goquery v1.10.2
+	github.com/spf13/cobra v1.9.1
+	golang.org/x/net v0.35.0
+)
+
+require (
 	github.com/andybalholm/cascadia v1.3.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/jung-kurt/gofpdf v1.16.2 // indirect
-	github.com/spf13/cobra v1.9.1 // indirect
 	github.com/spf13/pflag v1.0.6 // indirect
-	golang.org/x/net v0.35.0 // indirect
 )
 
 ================
 File: main.go
 ================
-package cmd
+package main
 
 import (
 	"fmt"
-	"github.com/spf13/cobra"
-	"github.com/yugo-ibuki/docrawl/internal/crawler"
-	"github.com/yugo-ibuki/docrawl/internal/pdf"
+	"os"
+
+	"github.com/yugo-ibuki/docrawl/cmd"
 )
 
-var (
-	baseURL    string
-	outputPath string
-	maxDepth   int
-	timeout    int
-)
-
-var rootCmd = &cobra.Command{
-	Use:   "document-crawler",
-	Short: "ドキュメントサイトをクローリングしてPDFに変換するツール",
-	Long: `document-crawlerはドキュメントサイト全体をクローリングし、
-内容をPDFとして保存するCLIツールです。技術のライブラリのような
-ドキュメントサイトを対象としています。`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if baseURL == "" {
-			return fmt.Errorf("ベースURLを指定してください")
-		}
-
-		crawler := crawler.New(baseURL, maxDepth, timeout)
-		pages, err := crawler.Crawl()
-		if err != nil {
-			return err
-		}
-
-		generator := pdf.NewGenerator(outputPath)
-		if err := generator.GeneratePDF(pages); err != nil {
-			return err
-		}
-
-		fmt.Printf("成功: %s にPDFが生成されました\n", outputPath)
-		return nil
-	},
+func main() {
+	if err := cmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }
 
-func Execute() error {
-	return rootCmd.Execute()
-}
+================
+File: raw_page.html
+================
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
 
-func init() {
-	rootCmd.Flags().StringVarP(&baseURL, "url", "u", "", "クローリング開始URLを指定 (必須)")
-	rootCmd.Flags().StringVarP(&outputPath, "output", "o", "output.pdf", "出力PDFファイルパス")
-	rootCmd.Flags().IntVarP(&maxDepth, "depth", "d", 3, "クローリングの最大深度")
-	rootCmd.Flags().IntVarP(&timeout, "timeout", "t", 30, "リクエストタイムアウト（秒）")
+<link rel="preconnect" href="https://www.googletagmanager.com">
+<script >(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+  new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+  j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+  'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+  })(window,document,'script','dataLayer','GTM-W8MVQXG');</script>
+  
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#00add8">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Material+Icons">
+<link rel="stylesheet" href="/css/styles.css">
+<link rel="icon" href="/images/favicon-gopher.png" sizes="any">
+<link rel="apple-touch-icon" href="/images/favicon-gopher-plain.png"/>
+<link rel="icon" href="/images/favicon-gopher.svg" type="image/svg+xml">
+<link rel="me" href="https://hachyderm.io/@golang">
 
-	rootCmd.MarkFlagRequired("url")
-}
+  
+  <script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+  new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+  j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+  'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+  })(window,document,'script','dataLayer','GTM-W8MVQXG');</script>
+  
+<script src="/js/site.js"></script>
+<meta name="og:url" content="https://go.dev/doc/">
+<meta name="og:title" content="Documentation - The Go Programming Language">
+<title>Documentation - The Go Programming Language</title>
+
+<meta name="og:image" content="https://go.dev/doc/gopher/gopher5logo.jpg">
+<meta name="twitter:image" content="https://go.dev/doc/gopher/gopherbelly300.jpg">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:site" content="@golang">
+</head>
+<body class="Site">
+  
+<noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-W8MVQXG"
+  height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+  
+
+
+<header class="Site-header js-siteHeader">
+  <div class="Header Header--dark">
+    <nav class="Header-nav">
+      <a href="/">
+        <img
+          class="js-headerLogo Header-logo"
+          src="/images/go-logo-white.svg"
+          alt="Go">
+      </a>
+      <div class="skip-navigation-wrapper">
+        <a class="skip-to-content-link" aria-label="Skip to main content" href="#main-content"> Skip to Main Content </a>
+      </div>
+      <div class="Header-rightContent">
+        <ul class="Header-menu">
+          <li class="Header-menuItem ">
+            <a href="#"  class="js-desktop-menu-hover" aria-label=Why&#32;Go aria-describedby="dropdown-description">
+              Why Go <i class="material-icons" aria-hidden="true">arrow_drop_down</i>
+            </a>
+            <div class="screen-reader-only" id="dropdown-description" hidden>
+              Press Enter to activate/deactivate dropdown
+            </div>
+              <ul class="Header-submenu js-desktop-submenu-hover" aria-label="submenu">
+                  <li class="Header-submenuItem">
+                    <div>
+                        <a href="/solutions/case-studies">
+                          Case Studies
+                          
+                        </a>
+                    </div>
+                    <p>Common problems companies solve with Go</p>
+                  </li>
+                  <li class="Header-submenuItem">
+                    <div>
+                        <a href="/solutions/use-cases">
+                          Use Cases
+                          
+                        </a>
+                    </div>
+                    <p>Stories about how and why companies use Go</p>
+                  </li>
+                  <li class="Header-submenuItem">
+                    <div>
+                        <a href="/security/">
+                          Security
+                          
+                        </a>
+                    </div>
+                    <p>How Go can help keep you secure by default</p>
+                  </li>
+              </ul>
+          </li>
+          <li class="Header-menuItem ">
+            <a href="/learn/"  aria-label=Learn aria-describedby="dropdown-description">
+              Learn 
+            </a>
+            <div class="screen-reader-only" id="dropdown-description" hidden>
+              Press Enter to activate/deactivate dropdown
+            </div>
+          </li>
+          <li class="Header-menuItem  Header-menuItem--active">
+            <a href="#"  class="js-desktop-menu-hover" aria-label=Docs aria-describedby="dropdown-description">
+              Docs <i class="material-icons" aria-hidden="true">arrow_drop_down</i>
+            </a>
+            <div class="screen-reader-only" id="dropdown-description" hidden>
+              Press Enter to activate/deactivate dropdown
+            </div>
+              <ul class="Header-submenu js-desktop-submenu-hover" aria-label="submenu">
+                  <li class="Header-submenuItem">
+                    <div>
+                        <a href="/doc/effective_go">
+                          Effective Go
+                          
+                        </a>
+                    </div>
+                    <p>Tips for writing clear, performant, and idiomatic Go code</p>
+                  </li>
+                  <li class="Header-submenuItem">
+                    <div>
+                        <a href="/doc">
+                          Go User Manual
+                          
+                        </a>
+                    </div>
+                    <p>A complete introduction to building software with Go</p>
+                  </li>
+                  <li class="Header-submenuItem">
+                    <div>
+                        <a href="https://pkg.go.dev/std">
+                          Standard library
+                          
+                        </a>
+                    </div>
+                    <p>Reference documentation for Go&#39;s standard library</p>
+                  </li>
+                  <li class="Header-submenuItem">
+                    <div>
+                        <a href="/doc/devel/release">
+                          Release Notes
+                          
+                        </a>
+                    </div>
+                    <p>Learn what&#39;s new in each Go release</p>
+                  </li>
+              </ul>
+          </li>
+          <li class="Header-menuItem ">
+            <a href="https://pkg.go.dev"  aria-label=Packages aria-describedby="dropdown-description">
+              Packages 
+            </a>
+            <div class="screen-reader-only" id="dropdown-description" hidden>
+              Press Enter to activate/deactivate dropdown
+            </div>
+          </li>
+          <li class="Header-menuItem ">
+            <a href="#"  class="js-desktop-menu-hover" aria-label=Community aria-describedby="dropdown-description">
+              Community <i class="material-icons" aria-hidden="true">arrow_drop_down</i>
+            </a>
+            <div class="screen-reader-only" id="dropdown-description" hidden>
+              Press Enter to activate/deactivate dropdown
+            </div>
+              <ul class="Header-submenu js-desktop-submenu-hover" aria-label="submenu">
+                  <li class="Header-submenuItem">
+                    <div>
+                        <a href="/talks/">
+                          Recorded Talks
+                          
+                        </a>
+                    </div>
+                    <p>Videos from prior events</p>
+                  </li>
+                  <li class="Header-submenuItem">
+                    <div>
+                        <a href="https://www.meetup.com/pro/go">
+                          Meetups
+                           <i class="material-icons">open_in_new</i>
+                        </a>
+                    </div>
+                    <p>Meet other local Go developers</p>
+                  </li>
+                  <li class="Header-submenuItem">
+                    <div>
+                        <a href="/wiki/Conferences">
+                          Conferences
+                           <i class="material-icons">open_in_new</i>
+                        </a>
+                    </div>
+                    <p>Learn and network with Go developers from around the world</p>
+                  </li>
+                  <li class="Header-submenuItem">
+                    <div>
+                        <a href="/blog">
+                          Go blog
+                          
+                        </a>
+                    </div>
+                    <p>The Go project&#39;s official blog.</p>
+                  </li>
+                  <li class="Header-submenuItem">
+                    <div>
+                        <a href="/help">
+                          Go project
+                          
+                        </a>
+                    </div>
+                    <p>Get help and stay informed from Go</p>
+                  </li>
+                  <li class="Header-submenuItem">
+                    <div>
+                        Get connected
+                    </div>
+                    <p></p>
+                      <div class="Header-socialIcons">
+                        
+                        <a class="Header-socialIcon" aria-label="Get connected with google-groups (Opens in new window)" href="https://groups.google.com/g/golang-nuts"><img src="/images/logos/social/google-groups.svg" /></a>
+                        <a class="Header-socialIcon" aria-label="Get connected with github (Opens in new window)" href="https://github.com/golang"><img src="/images/logos/social/github.svg" /></a>
+                        <a class="Header-socialIcon" aria-label="Get connected with twitter (Opens in new window)" href="https://twitter.com/golang"><img src="/images/logos/social/twitter.svg" /></a>
+                        <a class="Header-socialIcon" aria-label="Get connected with reddit (Opens in new window)" href="https://www.reddit.com/r/golang/"><img src="/images/logos/social/reddit.svg" /></a>
+                        <a class="Header-socialIcon" aria-label="Get connected with slack (Opens in new window)" href="https://invite.slack.golangbridge.org/"><img src="/images/logos/social/slack.svg" /></a>
+                        <a class="Header-socialIcon" aria-label="Get connected with stack-overflow (Opens in new window)" href="https://stackoverflow.com/tags/go"><img src="/images/logos/social/stack-overflow.svg" /></a>
+                      </div>
+                  </li>
+              </ul>
+          </li>
+        </ul>
+        <button class="Header-navOpen js-headerMenuButton Header-navOpen--white" aria-label="Open navigation.">
+        </button>
+      </div>
+    </nav>
+    
+  </div>
+</header>
+<aside class="NavigationDrawer js-header">
+  <nav class="NavigationDrawer-nav">
+    <div class="NavigationDrawer-header">
+      <a href="/">
+        <img class="NavigationDrawer-logo" src="/images/go-logo-blue.svg" alt="Go.">
+      </a>
+    </div>
+    <ul class="NavigationDrawer-list">
+        
+          <li class="NavigationDrawer-listItem js-mobile-subnav-trigger  NavigationDrawer-hasSubnav">
+            <a href="#"><span>Why Go</span> <i class="material-icons">navigate_next</i></a>
+
+            <div class="NavigationDrawer NavigationDrawer-submenuItem">
+              <nav class="NavigationDrawer-nav">
+                <div class="NavigationDrawer-header">
+                  <a href="#"><i class="material-icons">navigate_before</i>Why Go</a>
+                </div>
+                <ul class="NavigationDrawer-list">
+                    <li class="NavigationDrawer-listItem">
+                        <a href="/solutions/case-studies">
+                          Case Studies
+                          
+                        </a>
+                      
+                    </li>
+                    <li class="NavigationDrawer-listItem">
+                        <a href="/solutions/use-cases">
+                          Use Cases
+                          
+                        </a>
+                      
+                    </li>
+                    <li class="NavigationDrawer-listItem">
+                        <a href="/security/">
+                          Security
+                          
+                        </a>
+                      
+                    </li>
+                </ul>
+              </div>
+            </div>
+          </li>
+
+        
+        
+          <li class="NavigationDrawer-listItem ">
+            <a href="/learn/">Learn</a>
+          </li>
+        
+        
+          <li class="NavigationDrawer-listItem js-mobile-subnav-trigger  NavigationDrawer-listItem--active NavigationDrawer-hasSubnav">
+            <a href="#"><span>Docs</span> <i class="material-icons">navigate_next</i></a>
+
+            <div class="NavigationDrawer NavigationDrawer-submenuItem">
+              <nav class="NavigationDrawer-nav">
+                <div class="NavigationDrawer-header">
+                  <a href="#"><i class="material-icons">navigate_before</i>Docs</a>
+                </div>
+                <ul class="NavigationDrawer-list">
+                    <li class="NavigationDrawer-listItem">
+                        <a href="/doc/effective_go">
+                          Effective Go
+                          
+                        </a>
+                      
+                    </li>
+                    <li class="NavigationDrawer-listItem">
+                        <a href="/doc">
+                          Go User Manual
+                          
+                        </a>
+                      
+                    </li>
+                    <li class="NavigationDrawer-listItem">
+                        <a href="https://pkg.go.dev/std">
+                          Standard library
+                          
+                        </a>
+                      
+                    </li>
+                    <li class="NavigationDrawer-listItem">
+                        <a href="/doc/devel/release">
+                          Release Notes
+                          
+                        </a>
+                      
+                    </li>
+                </ul>
+              </div>
+            </div>
+          </li>
+
+        
+        
+          <li class="NavigationDrawer-listItem ">
+            <a href="https://pkg.go.dev">Packages</a>
+          </li>
+        
+        
+          <li class="NavigationDrawer-listItem js-mobile-subnav-trigger  NavigationDrawer-hasSubnav">
+            <a href="#"><span>Community</span> <i class="material-icons">navigate_next</i></a>
+
+            <div class="NavigationDrawer NavigationDrawer-submenuItem">
+              <nav class="NavigationDrawer-nav">
+                <div class="NavigationDrawer-header">
+                  <a href="#"><i class="material-icons">navigate_before</i>Community</a>
+                </div>
+                <ul class="NavigationDrawer-list">
+                    <li class="NavigationDrawer-listItem">
+                        <a href="/talks/">
+                          Recorded Talks
+                          
+                        </a>
+                      
+                    </li>
+                    <li class="NavigationDrawer-listItem">
+                        <a href="https://www.meetup.com/pro/go">
+                          Meetups
+                           <i class="material-icons">open_in_new</i>
+                        </a>
+                      
+                    </li>
+                    <li class="NavigationDrawer-listItem">
+                        <a href="/wiki/Conferences">
+                          Conferences
+                           <i class="material-icons">open_in_new</i>
+                        </a>
+                      
+                    </li>
+                    <li class="NavigationDrawer-listItem">
+                        <a href="/blog">
+                          Go blog
+                          
+                        </a>
+                      
+                    </li>
+                    <li class="NavigationDrawer-listItem">
+                        <a href="/help">
+                          Go project
+                          
+                        </a>
+                      
+                    </li>
+                    <li class="NavigationDrawer-listItem">
+                        <div>Get connected</div>
+                        <div class="Header-socialIcons">
+                          
+                            <a class="Header-socialIcon" href="https://groups.google.com/g/golang-nuts"><img src="/images/logos/social/google-groups.svg" /></a>
+                            <a class="Header-socialIcon" href="https://github.com/golang"><img src="/images/logos/social/github.svg" /></a>
+                            <a class="Header-socialIcon" href="https://twitter.com/golang"><img src="/images/logos/social/twitter.svg" /></a>
+                            <a class="Header-socialIcon" href="https://www.reddit.com/r/golang/"><img src="/images/logos/social/reddit.svg" /></a>
+                            <a class="Header-socialIcon" href="https://invite.slack.golangbridge.org/"><img src="/images/logos/social/slack.svg" /></a>
+                            <a class="Header-socialIcon" href="https://stackoverflow.com/tags/go"><img src="/images/logos/social/stack-overflow.svg" /></a>
+                        </div>
+                    </li>
+                </ul>
+              </div>
+            </div>
+          </li>
+
+        
+    </ul>
+  </nav>
+</aside>
+<div class="NavigationDrawer-scrim js-scrim" role="presentation"></div>
+<main class="SiteContent SiteContent--default" id="main-content">
+  
+
+
+<article class="Doc Article">
+
+
+
+
+
+<h1>Documentation</h1>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<p>
+The Go programming language is an open source project to make programmers more
+productive.
+</p>
+
+<p>
+Go is expressive, concise, clean, and efficient. Its concurrency
+mechanisms make it easy to write programs that get the most out of multicore
+and networked machines, while its novel type system enables flexible and
+modular program construction. Go compiles quickly to machine code yet has the
+convenience of garbage collection and the power of run-time reflection. It's a
+fast, statically typed, compiled language that feels like a dynamically typed,
+interpreted language.
+</p>
+
+<div class="Masonry">
+
+<section id="getting-started" class="BigCard">
+
+<h2>Getting Started</h2>
+
+<h3 id="installing"><a href="/doc/install" aria-describedby="index-description">Installing Go</a></h3>
+<p>Instructions for downloading and installing Go.</p>
+
+<h3 id="get-started-tutorial"><a href="/doc/tutorial/getting-started.html" aria-describedby="index-description">Tutorial: Getting started</a></h3>
+<p>A brief Hello, World tutorial to get started. Learn a bit about Go code, tools, packages, and modules.</p>
+
+<h3 id="create-module-tutorial"><a href="/doc/tutorial/create-module.html" aria-describedby="index-description">Tutorial: Create a module</a></h3>
+<p>A tutorial of short topics introducing functions, error handling, arrays, maps, unit testing, and compiling.</p>
+
+<h3 id="workspaces-tutorial"><a href="/doc/tutorial/workspaces.html" aria-describedby="index-description">Tutorial: Getting started with multi-module workspaces</a></h3>
+<p>Introduces the basics of creating and using multi-module workspaces in Go. Multi-module workspaces are useful for making changes across multiple modules.</p>
+
+<h3 id="web-service-gin-tutorial"><a href="/doc/tutorial/web-service-gin.html" aria-describedby="index-description">Tutorial: Developing a RESTful API with Go and Gin</a></h3>
+<p>Introduces the basics of writing a RESTful web service API with Go and the Gin Web Framework.</p>
+
+<h3 id="generics-tutorial"><a href="/doc/tutorial/generics.html" aria-describedby="index-description">Tutorial: Getting started with generics</a></h3>
+<p>With generics, you can declare and use functions or types that are written to work with any of a set of types provided by calling code.</p>
+
+<h3 id="fuzz-tutorial"><a href="/doc/tutorial/fuzz.html" aria-describedby="index-description">Tutorial: Getting started with fuzzing</a></h3>
+<p>Fuzzing can generate inputs to your tests that can catch edge cases and security issues that you may have missed.</p>
+
+<h3 id="writing-web-applications"><a href="/doc/articles/wiki/" aria-describedby="index-description">Writing Web Applications</a></h3>
+<p>Building a simple web application.</p>
+
+<h3 id="code"><a href="code.html" aria-describedby="index-description">How to write Go code</a></h3>
+<p>
+This doc explains how to develop a simple set of Go packages inside a module,
+and it shows how to use the <a href="/cmd/go/"><code>go</code>&nbsp;command</a>
+to build and test packages.
+</p>
+
+<h3 id="go_tour"><a href="/tour/" aria-describedby="index-description">A Tour of Go</a></h3>
+<p>
+An interactive introduction to Go in four sections.
+The first section covers basic syntax and data structures; the second discusses
+methods and interfaces; the third is about Generics; and the fourth introduces Go's concurrency primitives.
+Each section concludes with a few exercises so you can practice what you've
+learned. You can <a href="/tour/" aria-describedby="index-description">take the tour online</a> or install it locally with:
+</p>
+
+<pre class="CopyPaste">
+	<span>$ go install golang.org/x/website/tour@latest</span>
+	<button aria-label="Copy and paste the code.">
+	  <img class="CopyPaste-icon" src="/images/icons/copy-paste.svg" />
+	  <img class="CopyPaste-icon CopyPaste-icon-dark" src="/images/icons/copy-paste-dark.svg" />
+	</button>
+</pre>
+
+<p>
+This will place the <code>tour</code> binary in your
+<a href="/cmd/go/#hdr-GOPATH_and_Modules">GOPATH</a>'s <code>bin</code> directory.
+</p>
+
+</section>
+
+
+<section id="learning" class="BigCard">
+
+<h2>Using and understanding Go</h2>
+
+<h3 id="effective_go"><a href="effective_go.html" aria-describedby="index-description">Effective Go</a></h3>
+<p>
+A document that gives tips for writing clear, idiomatic Go code.
+A must read for any new Go programmer. It augments the tour and
+the language specification, both of which should be read first.
+</p>
+
+<h3 id="faq"><a href="/doc/faq" aria-describedby="index-description">Frequently Asked Questions (FAQ)</a></h3>
+
+<p>
+Answers to common questions about Go.
+</p>
+
+<h3 id="editors"><a href="editors.html" aria-describedby="index-description">Editor plugins and IDEs</a></h3>
+<p>
+A document that summarizes commonly used editor plugins and IDEs with
+Go support.
+</p>
+
+<h3 id="diagnostics"><a href="/doc/diagnostics.html" aria-describedby="index-description">Diagnostics</a></h3>
+<p>
+Summarizes tools and methodologies to diagnose problems in Go programs.
+</p>
+
+<h3 id="gc-guide"><a href="/doc/gc-guide" aria-describedby="index-description">A Guide to the Go Garbage Collector</a></h3>
+<p>
+A document that describes how Go manages memory, and how to make the most of it.
+</p>
+
+<h3 id="dependencies"><a href="/doc/modules/managing-dependencies" aria-describedby="index-description">Managing dependencies</a></h3>
+<p>
+When your code uses external packages, those packages (distributed as modules) become dependencies.
+</p>
+
+<h3 id="fuzzing"><a href="/security/fuzz" aria-describedby="index-description">Fuzzing</a></h3>
+<p>
+Main documentation page for Go fuzzing.
+</p>
+
+<h3 id="coverage"><a href="/doc/build-cover" aria-describedby="index-description">Coverage for Go applications</a></h3>
+<p>
+Main documentation page for coverage testing of Go applications.
+</p>
+
+<h3 id="pgo"><a href="/doc/pgo" aria-describedby="index-description">Profile-guided optimization</a></h3>
+<p>
+Main documentation page for profile-guided optimization (PGO) of Go applications.
+</p>
+
+</section>
+
+
+<section id="references" class="BigCard">
+
+<h2>References</h2>
+
+<h3 id="pkg"><a href="/pkg/" aria-describedby="index-description">Package Documentation</a></h3>
+<p>
+The documentation for the Go standard library.
+</p>
+
+<h3 id="cmd"><a href="/doc/cmd" aria-describedby="index-description">Command Documentation</a></h3>
+<p>
+The documentation for the Go tools.
+</p>
+
+<h3 id="spec"><a href="/ref/spec" aria-describedby="index-description">Language Specification</a></h3>
+<p>
+The official Go Language specification.
+</p>
+
+<h3 id="mod"><a href="/ref/mod" aria-describedby="index-description">Go Modules Reference</a></h3>
+<p>
+A detailed reference manual for Go's dependency management system.
+</p>
+
+<h3><a href="/doc/modules/gomod-ref" aria-describedby="index-description">go.mod file reference</a></h3>
+<p>
+Reference for the directives included in a go.mod file.
+</p>
+
+<h3 id="go_mem"><a href="/ref/mem" aria-describedby="index-description">The Go Memory Model</a></h3>
+<p>
+A document that specifies the conditions under which reads of a variable in
+one goroutine can be guaranteed to observe values produced by writes to the
+same variable in a different goroutine.
+</p>
+
+<h3 id="contributing"><a href="/doc/contribute" aria-describedby="index-description">Contribution Guide</a></h3>
+<p>Contributing to Go.</p>
+
+<h3 id="release"><a href="/doc/devel/release.html" aria-describedby="index-description">Release History</a></h3>
+<p>A summary of the changes between Go releases.</p>
+
+</section>
+
+
+<section id="data-access" class="BigCard">
+
+<h2>Accessing databases</h2>
+
+<h3 id="data-access-tutorial"><a href="/doc/tutorial/database-access" aria-describedby="index-description">Tutorial: Accessing a relational database</a></h3>
+<p>
+Introduces the basics of accessing a relational database using Go and the
+<code>database/sql</code> package in the standard library.
+</p>
+
+<h3 id="accessing-databases"><a href="/doc/database/index" aria-describedby="index-description">Accessing relational databases</a></h3>
+<p>
+An overview of Go's data access features.
+</p>
+
+<h3 id="open-handle"><a href="/doc/database/open-handle" aria-describedby="index-description">Opening a database handle</a></h3>
+<p>
+You use the Go database handle to execute database operations. Once you open a
+handle with database connection properties, the handle represents a connection
+pool it manages on your behalf.
+</p>
+
+<h3 id="change-data"><a href="/doc/database/change-data" aria-describedby="index-description">Executing SQL statements that don't return data</a></h3>
+<p>
+For SQL operations that might change the database, including SQL
+<code>INSERT</code>, <code>UPDATE</code>, and <code>DELETE</code>, you use
+<code>Exec</code> methods.
+</p>
+
+<h3 id="querying"><a href="/doc/database/querying" aria-describedby="index-description">Querying for data</a></h3>
+<p>
+For <code>SELECT</code> statements that return data from a query, using the
+<code>Query</code> or <code>QueryRow</code> method.
+</p>
+
+<h3 id="prepared-statements"><a href="/doc/database/prepared-statements" aria-describedby="index-description">Using prepared statements</a></h3>
+<p>
+Defining a prepared statement for repeated use can help your code run a bit
+faster by avoiding the overhead of re-creating the statement each time your
+code performs the database operation.
+</p>
+
+<h3 id="execute-transactions"><a href="/doc/database/execute-transactions" aria-describedby="index-description">Executing transactions</a></h3>
+<p>
+<code>sql.Tx</code> exports methods representing transaction-specific semantics,
+including <code>Commit</code> and <code>Rollback</code>, as well as methods you
+use to perform common database operations.
+</p>
+
+<h3 id="cancel-operations"><a href="/doc/database/cancel-operations" aria-describedby="index-description">Canceling in-progress database operations</a></h3>
+<p>
+Using <a href="https://pkg.go.dev/context#Context">context.Context</a>, you can
+have your application's function calls and services stop working early and
+return an error when their processing is no longer needed.
+</p>
+
+<h3 id="manage-connections"><a href="/doc/database/manage-connections" aria-describedby="index-description">Managing connections</a></h3>
+<p>
+For some advanced programs, you might need to tune connection pool parameters
+or work with connections explicitly.
+</p>
+
+<h3 id="sql-injection"><a href="/doc/database/sql-injection" aria-describedby="index-description">Avoiding SQL injection risk</a></h3>
+<p>
+You can avoid an SQL injection risk by providing SQL parameter values as
+<code>sql</code> package function arguments
+</p>
+
+</section>
+
+
+<section id="developing-modules" class="BigCard">
+
+<h2>Developing modules</h2>
+
+<h3 id="modules-develop-publish"><a href="/doc/modules/developing" aria-describedby="index-description">Developing and publishing modules</a></h3>
+<p>
+You can collect related packages into modules, then publish the modules for other developers to use. This topic gives an overview of developing and publishing modules.
+</p>
+
+<h3 id="modules-release-workflow"><a href="/doc/modules/release-workflow" aria-describedby="index-description">Module release and versioning workflow</a></h3>
+<p>
+When you develop modules for use by other developers, you can follow a workflow that helps ensure a reliable, consistent experience for developers using the module. This topic describes the high-level steps in that workflow.
+</p>
+
+<h3 id="modules-managing-source"><a href="/doc/modules/managing-source" aria-describedby="index-description">Managing module source</a></h3>
+<p>
+When you're developing modules to publish for others to use, you can help ensure that your modules are easier for other developers to use by following the repository conventions described in this topic.
+</p>
+
+<h3 id="modules-layout"><a href="/doc/modules/layout" aria-describedby="index-description">Organizing a Go module</a></h3>
+<p>
+What is the right way to organize the files and directories in a typical Go project? This topic discusses some common layouts depending on the kind of module you have.
+</p>
+
+<h3 id="modules-major-version"><a href="/doc/modules/major-version" aria-describedby="index-description">Developing a major version update</a></h3>
+<p>
+A major version update can be very disruptive to your module's users because it includes breaking changes and represents a new module. Learn more in this topic.
+</p>
+
+<h3 id="modules-publishing"><a href="/doc/modules/publishing" aria-describedby="index-description">Publishing a module</a></h3>
+
+<p>
+When you want to make a module available for other developers, you publish it so that it's visible to Go tools. Once you've published the module, developers importing its packages will be able to resolve a dependency on the module by running commands such as <code>go get</code>.
+</p>
+
+<h3 id="modules-version-numbers"><a href="/doc/modules/version-numbers" aria-describedby="index-description">Module version numbering</a></h3>
+
+<p>
+A module's developer uses each part of a module's version number to signal the version’s stability and backward compatibility. For each new release, a module's release version number specifically reflects the nature of the module's changes since the preceding release.
+</p>
+
+</section>
+
+
+<section id="talks" class="BigCard">
+
+<h2>Talks</h2>
+
+<h3 id="video_tour_of_go"><a href="https://research.swtch.com/gotour" aria-describedby="index-description">A Video Tour of Go</a></h3>
+<p>
+Three things that make Go fast, fun, and productive:
+interfaces, reflection, and concurrency. Builds a toy web crawler to
+demonstrate these.
+</p>
+
+<h3 id="go_code_that_grows"><a href="https://vimeo.com/53221560" aria-describedby="index-description">Code that grows with grace</a></h3>
+<p>
+One of Go's key design goals is code adaptability; that it should be easy to take a simple design and build upon it in a clean and natural way. In this talk Andrew Gerrand describes a simple "chat roulette" server that matches pairs of incoming TCP connections, and then use Go's concurrency mechanisms, interfaces, and standard library to extend it with a web interface and other features. While the function of the program changes dramatically, Go's flexibility preserves the original design as it grows.
+</p>
+
+<h3 id="go_concurrency_patterns"><a href="https://www.youtube.com/watch?v=f6kdp27TYZs" aria-describedby="index-description">Go Concurrency Patterns</a></h3>
+<p>
+Concurrency is the key to designing high performance network services. Go's concurrency primitives (goroutines and channels) provide a simple and efficient means of expressing concurrent execution. In this talk we see how tricky concurrency problems can be solved gracefully with simple Go code.
+</p>
+
+<h3 id="advanced_go_concurrency_patterns"><a href="https://www.youtube.com/watch?v=QDDwwePbDtw" aria-describedby="index-description">Advanced Go Concurrency Patterns</a></h3>
+<p>
+This talk expands on the <i>Go Concurrency Patterns</i> talk to dive deeper into Go's concurrency primitives.
+</p>
+
+<h4 id="talks_more">More</h4>
+<p>
+See the <a href="/talks" aria-describedby="index-description">Go Talks site</a> and <a href="/wiki/GoTalks"  aria-describedby="index-description">wiki page</a> for more Go talks.
+</p>
+
+</section>
+
+
+<section id="codewalks" class="BigCard">
+
+<h2>Codewalks</h2>
+<p>
+Guided tours of Go programs.
+</p>
+
+<ul>
+<li><a href="/doc/codewalk/functions" aria-describedby="index-description">First-Class Functions in Go</a></li>
+<li><a href="/doc/codewalk/markov" aria-describedby="index-description">Generating arbitrary text: a Markov chain algorithm</a></li>
+<li><a href="/doc/codewalk/sharemem" aria-describedby="index-description">Share Memory by Communicating</a></li>
+</ul>
+
+<h3>Language</h3>
+<ul>
+<li><a href="/blog/json-rpc-tale-of-interfaces" aria-describedby="index-description">JSON-RPC: a tale of interfaces</a></li>
+<li><a href="/blog/gos-declaration-syntax" aria-describedby="index-description">Go's Declaration Syntax</a></li>
+<li><a href="/blog/defer-panic-and-recover" aria-describedby="index-description">Defer, Panic, and Recover</a></li>
+<li><a href="/blog/go-concurrency-patterns-timing-out-and" aria-describedby="index-description">Go Concurrency Patterns: Timing out, moving on</a></li>
+<li><a href="/blog/go-slices-usage-and-internals" aria-describedby="index-description">Go Slices: usage and internals</a></li>
+<li><a href="/blog/gif-decoder-exercise-in-go-interfaces" aria-describedby="index-description">A GIF decoder: an exercise in Go interfaces</a></li>
+<li><a href="/blog/error-handling-and-go" aria-describedby="index-description">Error Handling and Go</a></li>
+</ul>
+
+<h3>Packages</h3>
+<ul>
+<li><a href="/blog/json-and-go" aria-describedby="index-description">JSON and Go</a> - using the <a href="/pkg/encoding/json/" aria-describedby="index-description">json</a> package.</li>
+<li><a href="/blog/gobs-of-data" aria-describedby="index-description">Gobs of data</a> - the design and use of the <a href="/pkg/encoding/gob/" aria-describedby="index-description">gob</a> package.</li>
+<li><a href="/blog/laws-of-reflection" aria-describedby="index-description">The Laws of Reflection</a> - the fundamentals of the <a href="/pkg/reflect/" aria-describedby="index-description">reflect</a> package.</li>
+<li><a href="/blog/go-image-package" aria-describedby="index-description">The Go image package</a> - the fundamentals of the <a href="/pkg/image/" aria-describedby="index-description">image</a> package.</li>
+<li><a href="/blog/go-imagedraw-package">The Go image/draw package</a> - the fundamentals of the <a href="/pkg/image/draw/">image/draw</a> package.</li>
+</ul>
+
+<h3>Modules</h3>
+<ul>
+<li><a href="/blog/using-go-modules" aria-describedby="index-description">Using Go Modules</a> - an introduction to using modules in a simple project.</li>
+<li><a href="/blog/migrating-to-go-modules" aria-describedby="index-description">Migrating to Go Modules</a> - converting an existing project to use modules.</li>
+<li><a href="/blog/publishing-go-modules" aria-describedby="index-description">Publishing Go Modules</a> - how to make new versions of modules available to others.</li>
+<li><a href="/blog/v2-go-modules" aria-describedby="index-description">Go Modules: v2 and Beyond</a> - creating and publishing major versions 2 and higher.</li>
+<li><a href="/blog/module-compatibility" aria-describedby="index-description">Keeping Your Modules Compatible</a> - how to keep your modules compatible with prior minor/patch versions.</li>
+</ul>
+
+<h3>Tools</h3>
+<ul>
+<li><a href="/doc/articles/go_command.html" aria-describedby="index-description">About the Go command</a> - why we wrote it, what it is, what it's not, and how to use it.</li>
+<li><a href="/doc/comment" aria-describedby="index-description">Go Doc Comments</a> - writing good program documentation</li>
+<li><a href="/doc/gdb" aria-describedby="index-description">Debugging Go Code with GDB</a></li>
+<li><a href="/doc/articles/race_detector.html" aria-describedby="index-description">Data Race Detector</a> - a manual for the data race detector.</li>
+<li><a href="/doc/asm" aria-describedby="index-description">A Quick Guide to Go's Assembler</a> - an introduction to the assembler used by Go.</li>
+<li><a href="/blog/c-go-cgo" aria-describedby="index-description">C? Go? Cgo!</a> - linking against C code with <a href="/cmd/cgo/" aria-describedby="index-description">cgo</a>.</li>
+<li><a href="/blog/profiling-go-programs" aria-describedby="index-description">Profiling Go Programs</a></li>
+<li><a href="/blog/race-detector" aria-describedby="index-description">Introducing the Go Race Detector</a> - an introduction to the race detector.</li>
+</ul>
+
+</section>
+
+
+<section id="wiki" class="BigCard">
+
+<h2>Wiki</h2>
+<p>
+The <a href="/wiki" aria-describedby="index-description">Go Wiki</a>, maintained by the Go community, includes articles about the Go language, tools, and other resources.
+</p>
+
+<p id="learn_more">
+See the <a href="/wiki/Learn" aria-describedby="index-description">Learn</a> page at the <a href="/wiki" aria-describedby="index-description">Wiki</a>
+for more Go learning resources.
+</p>
+
+</section>
+
+
+<section id="nonenglish" class="BigCard">
+
+<h2>Non-English Documentation</h2>
+See the <a href="/wiki/NonEnglish" aria-describedby="index-description">NonEnglish</a> page
+at the <a href="/wiki" aria-describedby="index-description">Wiki</a> for localized
+documentation.
+</p>
+
+</section>
+
+<div class="screen-reader-only" id="index-description" hidden>
+	Opens in new window.
+</div>
+</div>
+
+
+
+
+
+</article>
+
+
+
+</main>
+<footer class="Site-footer">
+  <div class="Footer">
+    <div class="Container">
+      <div class="Footer-links">
+          <div class="Footer-linkColumn">
+            <a href="/solutions/" class="Footer-link Footer-link--primary" aria-describedby="footer-description">
+              Why Go
+            </a>
+              <a href="/solutions/use-cases" class="Footer-link" aria-describedby="footer-description">
+                Use Cases
+              </a>
+              <a href="/solutions/case-studies" class="Footer-link" aria-describedby="footer-description">
+                Case Studies
+              </a>
+          </div>
+          <div class="Footer-linkColumn">
+            <a href="/learn/" class="Footer-link Footer-link--primary" aria-describedby="footer-description">
+              Get Started
+            </a>
+              <a href="/play" class="Footer-link" aria-describedby="footer-description">
+                Playground
+              </a>
+              <a href="/tour/" class="Footer-link" aria-describedby="footer-description">
+                Tour
+              </a>
+              <a href="https://stackoverflow.com/questions/tagged/go?tab=Newest" class="Footer-link" aria-describedby="footer-description">
+                Stack Overflow
+              </a>
+              <a href="/help/" class="Footer-link" aria-describedby="footer-description">
+                Help
+              </a>
+          </div>
+          <div class="Footer-linkColumn">
+            <a href="https://pkg.go.dev" class="Footer-link Footer-link--primary" aria-describedby="footer-description">
+              Packages
+            </a>
+              <a href="/pkg/" class="Footer-link" aria-describedby="footer-description">
+                Standard Library
+              </a>
+              <a href="https://pkg.go.dev/about" class="Footer-link" aria-describedby="footer-description">
+                About Go Packages
+              </a>
+          </div>
+          <div class="Footer-linkColumn">
+            <a href="/project" class="Footer-link Footer-link--primary" aria-describedby="footer-description">
+              About
+            </a>
+              <a href="/dl/" class="Footer-link" aria-describedby="footer-description">
+                Download
+              </a>
+              <a href="/blog/" class="Footer-link" aria-describedby="footer-description">
+                Blog
+              </a>
+              <a href="https://github.com/golang/go/issues" class="Footer-link" aria-describedby="footer-description">
+                Issue Tracker
+              </a>
+              <a href="/doc/devel/release" class="Footer-link" aria-describedby="footer-description">
+                Release Notes
+              </a>
+              <a href="/brand" class="Footer-link" aria-describedby="footer-description">
+                Brand Guidelines
+              </a>
+              <a href="/conduct" class="Footer-link" aria-describedby="footer-description">
+                Code of Conduct
+              </a>
+          </div>
+          <div class="Footer-linkColumn">
+            <a href="https://www.twitter.com/golang" class="Footer-link Footer-link--primary" aria-describedby="footer-description">
+              Connect
+            </a>
+              <a href="https://www.twitter.com/golang" class="Footer-link" aria-describedby="footer-description">
+                Twitter
+              </a>
+              <a href="https://github.com/golang" class="Footer-link" aria-describedby="footer-description">
+                GitHub
+              </a>
+              <a href="https://invite.slack.golangbridge.org/" class="Footer-link" aria-describedby="footer-description">
+                Slack
+              </a>
+              <a href="https://reddit.com/r/golang" class="Footer-link" aria-describedby="footer-description">
+                r/golang
+              </a>
+              <a href="https://www.meetup.com/pro/go" class="Footer-link" aria-describedby="footer-description">
+                Meetup
+              </a>
+              <a href="https://golangweekly.com/" class="Footer-link" aria-describedby="footer-description">
+                Golang Weekly
+              </a>
+          </div>
+      </div>
+    </div>
+  </div>
+  <div class="screen-reader-only" id="footer-description" hidden>
+          Opens in new window.
+  </div>
+  <div class="Footer">
+    <div class="Container Container--fullBleed">
+      <div class="Footer-bottom">
+        <img class="Footer-gopher" src="/images/gophers/pilot-bust.svg" alt="The Go Gopher">
+        <ul class="Footer-listRow">
+          <li class="Footer-listItem">
+            <a href="/copyright" aria-describedby="footer-description">Copyright</a>
+          </li>
+          <li class="Footer-listItem">
+            <a href="/tos" aria-describedby="footer-description">Terms of Service</a>
+          </li>
+          <li class="Footer-listItem">
+            <a href="http://www.google.com/intl/en/policies/privacy/" aria-describedby="footer-description"
+              target="_blank"
+              rel="noopener">
+              Privacy Policy
+            </a>
+            </li>
+          <li class="Footer-listItem">
+            <a
+              href="/s/website-issue" aria-describedby="footer-description"
+              target="_blank"
+              rel="noopener"
+              >
+              Report an Issue
+            </a>
+          </li>
+          <li class="Footer-listItem go-Footer-listItem">
+            <button class="go-Button go-Button--text go-Footer-toggleTheme js-toggleTheme" aria-label="Toggle theme">
+              <img
+                data-value="auto"
+                class="go-Icon go-Icon--inverted"
+                height="24"
+                width="24"
+                src="/images/icons/brightness_6_gm_grey_24dp.svg"
+                alt="System theme">
+              <img
+                data-value="dark"
+                class="go-Icon go-Icon--inverted"
+                height="24"
+                width="24"
+                src="/images/icons/brightness_2_gm_grey_24dp.svg"
+                alt="Dark theme">
+              <img
+                data-value="light"
+                class="go-Icon go-Icon--inverted"
+                height="24"
+                width="24"
+                src="/images/icons/light_mode_gm_grey_24dp.svg"
+                alt="Light theme">
+            </button>
+          </li>
+        </ul>
+        <a class="Footer-googleLogo" target="_blank" href="https://google.com" rel="noopener">
+          <img class="Footer-googleLogoImg" src="/images/google-white.png" alt="Google logo">
+        </a>
+      </div>
+    </div>
+  </div>
+  <script src="/js/jquery.js"></script>
+  <script src="/js/carousels.js"></script>
+  <script src="/js/searchBox.js"></script>
+  <script src="/js/misc.js"></script>
+  <script src="/js/hats.js"></script>
+  <script src="/js/playground.js"></script>
+  <script src="/js/godocs.js"></script>
+  <script async src="/js/copypaste.js"></script>
+</footer>
+<section class="Cookie-notice js-cookieNotice">
+  <div>go.dev uses cookies from Google to deliver and enhance the quality of its services and to
+  analyze traffic. <a target=_blank href="https://policies.google.com/technologies/cookies">Learn more.</a></div>
+  <div><button class="go-Button">Okay</button></div>
+</section>
+</body>
+</html>
 
 ================
 File: README.md
