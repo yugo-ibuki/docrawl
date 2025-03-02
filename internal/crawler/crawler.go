@@ -1,12 +1,15 @@
 package crawler
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -22,25 +25,95 @@ type Page struct {
 
 // Crawler はウェブサイトをクロールする構造体
 type Crawler struct {
-	baseURL  string
-	maxDepth int
-	timeout  int
-	delay    time.Duration
+	baseURL     string
+	maxDepth    int
+	timeout     int
+	delay       time.Duration
+	totalTime   time.Duration // 総実行時間
+	visitedURLs map[string]bool
+	mu          sync.Mutex // 並行アクセスのための排他制御
 }
 
 // New は新しいCrawlerインスタンスを作成する
-func New(baseURL string, maxDepth, timeout int, delaySeconds float64) *Crawler {
+func New(baseURL string, maxDepth, timeout int, delaySeconds float64, totalTimeSeconds int) *Crawler {
 	return &Crawler{
-		baseURL:  baseURL,
-		maxDepth: maxDepth,
-		timeout:  timeout,
-		delay:    time.Duration(delaySeconds * float64(time.Second)),
+		baseURL:     baseURL,
+		maxDepth:    maxDepth,
+		timeout:     timeout,
+		delay:       time.Duration(delaySeconds * float64(time.Second)),
+		totalTime:   time.Duration(totalTimeSeconds) * time.Second,
+		visitedURLs: make(map[string]bool),
 	}
 }
 
 // Crawl はベースURLからクローリングを開始し、見つかったページをすべて返す
 func (c *Crawler) Crawl() ([]Page, error) {
-	fmt.Printf("ページをクロール中: %s\n", c.baseURL)
+	var pages []Page
+	var mu sync.Mutex // pagesの保護用ミューテックス
+	
+	// コンテキストを作成（総時間制限付き）
+	ctx, cancel := context.WithTimeout(context.Background(), c.totalTime)
+	defer cancel()
+
+	// エラーチャネルを作成
+	errChan := make(chan error, 1)
+	done := make(chan bool, 1)
+
+	// クローリングを別のゴルーチンで実行
+	go func() {
+		err := c.crawlRecursive(ctx, c.baseURL, 0, &pages, &mu)
+		if err != nil && err != context.DeadlineExceeded {
+			errChan <- err
+		}
+		done <- true
+	}()
+
+	// タイムアウトまたはクローリング完了を待つ
+	select {
+	case err := <-errChan:
+		return pages, fmt.Errorf("クローリング中にエラーが発生: %w", err)
+	case <-ctx.Done():
+		if ctx.Err() == context.DeadlineExceeded {
+			fmt.Println("\n指定された時間が経過したため、クローリングを終了します")
+		}
+		<-done // クローリングの完了を待つ
+		return pages, nil
+	case <-done:
+		return pages, nil
+	}
+}
+
+// crawlRecursive は再帰的にページをクロールする
+func (c *Crawler) crawlRecursive(ctx context.Context, url string, depth int, pages *[]Page, mu *sync.Mutex) error {
+	// コンテキストのキャンセルをチェック
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	// 最大深度チェック
+	if depth > c.maxDepth {
+		return nil
+	}
+
+	// 既に訪問済みのURLはスキップ（スレッドセーフに）
+	c.mu.Lock()
+	if c.visitedURLs[url] {
+		c.mu.Unlock()
+		return nil
+	}
+	c.visitedURLs[url] = true
+	c.mu.Unlock()
+
+	fmt.Printf("ページをクロール中 (深度 %d): %s\n", depth, url)
+
+	// 遅延を入れる
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(c.delay):
+	}
 
 	// シンプルなHTTPクライアントを作成
 	client := &http.Client{
@@ -48,9 +121,9 @@ func (c *Crawler) Crawl() ([]Page, error) {
 	}
 
 	// リクエストの設定
-	req, err := http.NewRequest("GET", c.baseURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// ブラウザのUser-Agentを設定
@@ -60,20 +133,20 @@ func (c *Crawler) Crawl() ([]Page, error) {
 	// リクエストを送信
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
 
 	// レスポンスボディを読み込む
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// HTMLを解析
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// タイトルを取得
@@ -86,15 +159,78 @@ func (c *Crawler) Crawl() ([]Page, error) {
 	// 結果を表示
 	fmt.Printf("テキストコンテンツサイズ: %d bytes\n", len(textContent))
 
-	// 1ページのみを返す
-	return []Page{
-		{
-			URL:     c.baseURL,
-			Title:   title,
-			Content: textContent,
-			Depth:   0,
-		},
-	}, nil
+	// ページを追加（スレッドセーフに）
+	mu.Lock()
+	*pages = append(*pages, Page{
+		URL:     url,
+		Title:   title,
+		Content: textContent,
+		Depth:   depth,
+	})
+	mu.Unlock()
+
+	// 同じドメイン内のリンクを収集して再帰的にクロール
+	baseURL, err := parseBaseURL(url)
+	if err != nil {
+		return err
+	}
+
+	var links []string
+	doc.Find("a").Each(func(i int, s *goquery.Selection) {
+		if href, exists := s.Attr("href"); exists {
+			nextURL, err := resolveURL(baseURL, href)
+			if err != nil {
+				return
+			}
+
+			// 同じドメインのURLのみを処理
+			if strings.HasPrefix(nextURL, baseURL) {
+				links = append(links, nextURL)
+			}
+		}
+	})
+
+	// 各リンクを順番にクロール
+	for _, link := range links {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if err := c.crawlRecursive(ctx, link, depth+1, pages, mu); err != nil {
+				if err == context.DeadlineExceeded {
+					return err
+				}
+				fmt.Printf("警告: %sのクロール中にエラーが発生: %v\n", link, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// parseBaseURL はURLからベースURLを抽出する
+func parseBaseURL(urlStr string) (string, error) {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s://%s", u.Scheme, u.Host), nil
+}
+
+// resolveURL は相対URLを絶対URLに解決する
+func resolveURL(base, ref string) (string, error) {
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+
+	refURL, err := url.Parse(ref)
+	if err != nil {
+		return "", err
+	}
+
+	resolvedURL := baseURL.ResolveReference(refURL)
+	return resolvedURL.String(), nil
 }
 
 // extractText はHTMLドキュメントからプレーンテキストを抽出する
@@ -186,13 +322,25 @@ func (c *Crawler) GenerateTXT(pages []Page, outputPath string) error {
 	defer file.Close()
 
 	// ヘッダー情報を書き込み
-	fmt.Fprintf(file, "# ドキュメント: %s\n", pages[0].Title)
-	fmt.Fprintf(file, "# URL: %s\n", pages[0].URL)
-	fmt.Fprintf(file, "# 取得日時: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(file, "# クロール結果\n")
+	fmt.Fprintf(file, "# 開始URL: %s\n", c.baseURL)
+	fmt.Fprintf(file, "# 取得日時: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(file, "# 取得ページ数: %d\n\n", len(pages))
 
-	// コンテンツをクリーンアップして書き込み
-	cleanedContent := cleanupTextContent(pages[0].Content)
-	fmt.Fprintln(file, cleanedContent)
+	// 各ページの内容を書き込み
+	for i, page := range pages {
+		fmt.Fprintf(file, "\n%s\n", strings.Repeat("=", 80))
+		fmt.Fprintf(file, "# ページ %d/%d\n", i+1, len(pages))
+		fmt.Fprintf(file, "# URL: %s\n", page.URL)
+		fmt.Fprintf(file, "# 深度: %d\n", page.Depth)
+		fmt.Fprintf(file, "%s\n", strings.Repeat("=", 80))
+		fmt.Fprintln(file)
+
+		// コンテンツをクリーンアップして書き込み
+		cleanedContent := cleanupTextContent(page.Content)
+		fmt.Fprintln(file, cleanedContent)
+		fmt.Fprintln(file)
+	}
 
 	// 成功メッセージを表示
 	fmt.Printf("テキストファイルが生成されました: %s\n", outputPath)

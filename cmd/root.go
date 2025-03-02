@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+
 	"github.com/spf13/cobra"
 	"github.com/yugo-ibuki/docrawl/internal/crawler"
 	"github.com/yugo-ibuki/docrawl/internal/pdf"
@@ -14,6 +15,7 @@ var (
 	timeout      int
 	delaySeconds float64 // クローリング間の遅延（秒）
 	outputFormat string  // 出力形式（txtまたはpdf）
+	totalTime    int    // 総実行時間（秒）
 )
 
 var rootCmd = &cobra.Command{
@@ -28,7 +30,7 @@ var rootCmd = &cobra.Command{
 		}
 
 		// クローラーを初期化
-		crawler := crawler.New(baseURL, maxDepth, timeout, delaySeconds)
+		crawler := crawler.New(baseURL, maxDepth, timeout, delaySeconds, totalTime)
 		pages, err := crawler.Crawl()
 		if err != nil {
 			return err
@@ -82,6 +84,7 @@ func init() {
 	rootCmd.Flags().IntVarP(&timeout, "timeout", "t", 30, "リクエストタイムアウト（秒）")
 	rootCmd.Flags().Float64VarP(&delaySeconds, "delay", "w", 2.0, "リクエスト間の待機時間（秒）")
 	rootCmd.Flags().StringVarP(&outputFormat, "format", "f", "txt", "出力形式 (txt または pdf)")
+	rootCmd.Flags().IntVarP(&totalTime, "total-time", "T", 300, "総実行時間（秒）")
 
 	rootCmd.MarkFlagRequired("url")
 }
