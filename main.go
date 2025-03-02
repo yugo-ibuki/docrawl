@@ -8,10 +8,11 @@ import (
 )
 
 var (
-	baseURL    string
-	outputPath string
-	maxDepth   int
-	timeout    int
+	baseURL      string
+	outputPath   string
+	maxDepth     int
+	timeout      int
+	delaySeconds float64
 )
 
 var rootCmd = &cobra.Command{
@@ -25,7 +26,7 @@ var rootCmd = &cobra.Command{
 			return fmt.Errorf("ベースURLを指定してください")
 		}
 
-		crawler := crawler.New(baseURL, maxDepth, timeout)
+		crawler := crawler.New(baseURL, maxDepth, timeout, delaySeconds)
 		pages, err := crawler.Crawl()
 		if err != nil {
 			return err
