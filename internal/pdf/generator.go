@@ -3,6 +3,7 @@ package pdf
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/yugo-ibuki/docrawl/internal/crawler"
@@ -83,13 +84,37 @@ func generateTextFile(pages []crawler.Page, outputPath string) error {
 
 // cleanupContent はコンテンツを整形する
 func cleanupContent(content string) string {
-	// 連続する空白行を削除
+	// 改行を統一（Windowsの CRLF を LF に変換）
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	
+	// 連続する空白行を削除（3行以上の空行を2行に）
 	for strings.Contains(content, "\n\n\n") {
 		content = strings.ReplaceAll(content, "\n\n\n", "\n\n")
 	}
-
+	
 	// 先頭と末尾の空白を削除
 	content = strings.TrimSpace(content)
-
-	return content
+	
+	// 行末の空白を削除
+	regexTrailingSpaces := regexp.MustCompile(`[ \t]+\n`)
+	content = regexTrailingSpaces.ReplaceAllString(content, "\n")
+	
+	// 連続するスペースを1つに
+	regexMultipleSpaces := regexp.MustCompile(`[ \t]{2,}`)
+	content = regexMultipleSpaces.ReplaceAllString(content, " ")
+	
+	// 見出し周りの空行を整理（見出し前に空行を挿入し、見出し後の空行を削除）
+	// 文字列を一括で置換するのではなく、必要な調整を行う
+	lines := strings.Split(content, "\n")
+	for i := 0; i < len(lines); i++ {
+		if i > 0 && strings.HasPrefix(strings.TrimSpace(lines[i]), "#") {
+			// 見出しの前に空行がなければ追加（すでに前が空行の場合は追加しない）
+			if lines[i-1] != "" {
+				lines = append(lines[:i], append([]string{""}, lines[i:]...)...)
+				i++ // 挿入された行をスキップ
+			}
+		}
+	}
+	
+	return strings.Join(lines, "\n")
 }

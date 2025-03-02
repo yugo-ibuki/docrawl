@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"golang.org/x/net/html"
 )
 
 // Page はクロールされたページの情報を格納する構造体
@@ -191,24 +190,49 @@ func (c *Crawler) GenerateTXT(pages []Page, outputPath string) error {
 	fmt.Fprintf(file, "# URL: %s\n", pages[0].URL)
 	fmt.Fprintf(file, "# 取得日時: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
 
-	// コンテンツを書き込み
-	fmt.Fprintln(file, pages[0].Content)
+	// コンテンツをクリーンアップして書き込み
+	cleanedContent := cleanupTextContent(pages[0].Content)
+	fmt.Fprintln(file, cleanedContent)
 
 	// 成功メッセージを表示
 	fmt.Printf("テキストファイルが生成されました: %s\n", outputPath)
 	return nil
 }
 
-// nodeToText はHTMLノードをテキストに変換するヘルパー関数
-func nodeToText(n *html.Node) string {
-	if n.Type == html.TextNode {
-		return n.Data
+// cleanupTextContent はテキストコンテンツを整形する
+func cleanupTextContent(content string) string {
+	// 改行を統一（Windowsの CRLF を LF に変換）
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	
+	// 連続する空白行を削除
+	for strings.Contains(content, "\n\n\n") {
+		content = strings.ReplaceAll(content, "\n\n\n", "\n\n")
 	}
-
-	var buf strings.Builder
-	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		buf.WriteString(nodeToText(c))
+	
+	// 先頭と末尾の空白を削除
+	content = strings.TrimSpace(content)
+	
+	// 行末の空白を削除
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimRight(line, " \t")
 	}
-
-	return buf.String()
+	
+	// 連続する空行を最大1行に制限
+	var result []string
+	prevEmpty := false
+	
+	for _, line := range lines {
+		isEmpty := len(strings.TrimSpace(line)) == 0
+		
+		if isEmpty && prevEmpty {
+			// 連続する空行をスキップ
+			continue
+		}
+		
+		result = append(result, line)
+		prevEmpty = isEmpty
+	}
+	
+	return strings.Join(result, "\n")
 }
