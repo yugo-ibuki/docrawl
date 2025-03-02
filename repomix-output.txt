@@ -1,0 +1,791 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+================================================================
+File Summary
+================================================================
+
+Purpose:
+--------
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+
+File Format:
+------------
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Multiple file entries, each consisting of:
+  a. A separator line (================)
+  b. The file path (File: path/to/file)
+  c. Another separator line
+  d. The full contents of the file
+  e. A blank line
+
+Usage Guidelines:
+-----------------
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+
+Notes:
+------
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+
+Additional Info:
+----------------
+
+================================================================
+Directory Structure
+================================================================
+cmd/
+  root.go
+internal/
+  crawler/
+    crawler.go
+  parser/
+    parser.go
+  pdf/
+    generator.go
+.gitignore
+go.mod
+main.go
+README.md
+
+================================================================
+Files
+================================================================
+
+================
+File: cmd/root.go
+================
+package cmd
+
+import (
+	"fmt"
+	"github.com/spf13/cobra"
+	"github.com/yugo-ibuki/docrawl/internal/crawler"
+	"github.com/yugo-ibuki/docrawl/internal/pdf"
+)
+
+var (
+	baseURL    string
+	outputPath string
+	maxDepth   int
+	timeout    int
+)
+
+var rootCmd = &cobra.Command{
+	Use:   "document-crawler",
+	Short: "ドキュメントサイトをクローリングしてPDFに変換するツール",
+	Long: `document-crawlerはドキュメントサイト全体をクローリングし、
+内容をPDFとして保存するCLIツールです。技術のライブラリのような
+ドキュメントサイトを対象としています。`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if baseURL == "" {
+			return fmt.Errorf("ベースURLを指定してください")
+		}
+
+		crawler := crawler.New(baseURL, maxDepth, timeout)
+		pages, err := crawler.Crawl()
+		if err != nil {
+			return err
+		}
+
+		generator := pdf.NewGenerator(outputPath)
+		if err := generator.GeneratePDF(pages); err != nil {
+			return err
+		}
+
+		fmt.Printf("成功: %s にPDFが生成されました\n", outputPath)
+		return nil
+	},
+}
+
+func Execute() error {
+	return rootCmd.Execute()
+}
+
+func init() {
+	rootCmd.Flags().StringVarP(&baseURL, "url", "u", "", "クローリング開始URLを指定 (必須)")
+	rootCmd.Flags().StringVarP(&outputPath, "output", "o", "output.pdf", "出力PDFファイルパス")
+	rootCmd.Flags().IntVarP(&maxDepth, "depth", "d", 3, "クローリングの最大深度")
+	rootCmd.Flags().IntVarP(&timeout, "timeout", "t", 30, "リクエストタイムアウト（秒）")
+
+	rootCmd.MarkFlagRequired("url")
+}
+
+================
+File: internal/crawler/crawler.go
+================
+package crawler
+
+import (
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/PuerkitoBio/goquery"
+	"github.com/yugo-ibuki/docrawl/internal/parser"
+)
+
+// Page はクロールされたページの情報を格納する構造体
+type Page struct {
+	URL     string
+	Title   string
+	Content string
+	Depth   int
+}
+
+// Crawler はウェブサイトをクロールする構造体
+type Crawler struct {
+	baseURL    string
+	maxDepth   int
+	timeout    int
+	visited    map[string]bool
+	visitedMux sync.Mutex
+	pages      []Page
+	pagesMux   sync.Mutex
+	semaphore  chan struct{}
+}
+
+// New は新しいCrawlerインスタンスを作成する
+func New(baseURL string, maxDepth, timeout int) *Crawler {
+	return &Crawler{
+		baseURL:   baseURL,
+		maxDepth:  maxDepth,
+		timeout:   timeout,
+		visited:   make(map[string]bool),
+		pages:     []Page{},
+		semaphore: make(chan struct{}, 5), // 同時に5つまでのリクエストを許可
+	}
+}
+
+// Crawl はベースURLからクローリングを開始し、見つかったページをすべて返す
+func (c *Crawler) Crawl() ([]Page, error) {
+	baseURLParsed, err := url.Parse(c.baseURL)
+	if err != nil {
+		return nil, err
+	}
+
+	// ベースURLのドメインを保存
+	baseDomain := baseURLParsed.Hostname()
+
+	// クローリング開始
+	err = c.crawlPage(c.baseURL, 0, baseDomain)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.pages, nil
+}
+
+// crawlPage は指定されたURLとその子URLをクロールする
+func (c *Crawler) crawlPage(pageURL string, depth int, baseDomain string) error {
+	// 最大深度をチェック
+	if depth > c.maxDepth {
+		return nil
+	}
+
+	// URLの正規化
+	normalizedURL := normalizeURL(pageURL)
+
+	// すでに訪れたページか確認
+	c.visitedMux.Lock()
+	if c.visited[normalizedURL] {
+		c.visitedMux.Unlock()
+		return nil
+	}
+	c.visited[normalizedURL] = true
+	c.visitedMux.Unlock()
+
+	// 同時実行数を制限
+	c.semaphore <- struct{}{}
+	defer func() { <-c.semaphore }()
+
+	// HTTPクライアントの作成
+	client := &http.Client{
+		Timeout: time.Duration(c.timeout) * time.Second,
+	}
+
+	// HTTPリクエスト
+	req, err := http.NewRequest("GET", normalizedURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "DocumentCrawler/1.0")
+
+	// HTTPレスポンス
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("ステータスコード %d: %s", resp.StatusCode, normalizedURL)
+	}
+
+	// goqueryでドキュメントを解析
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	// タイトルとコンテンツを抽出
+	title := doc.Find("title").Text()
+	content := parser.ExtractMainContent(doc)
+
+	// ページを保存
+	page := Page{
+		URL:     normalizedURL,
+		Title:   title,
+		Content: content,
+		Depth:   depth,
+	}
+
+	c.pagesMux.Lock()
+	c.pages = append(c.pages, page)
+	c.pagesMux.Unlock()
+
+	fmt.Printf("クロール完了: %s (深度: %d)\n", normalizedURL, depth)
+
+	// リンクを抽出して再帰的にクロール
+	var wg sync.WaitGroup
+	doc.Find("a").Each(func(i int, s *goquery.Selection) {
+		href, exists := s.Attr("href")
+		if !exists {
+			return
+		}
+
+		// 相対URLを絶対URLに変換
+		absoluteURL, err := resolveURL(normalizedURL, href)
+		if err != nil {
+			return
+		}
+
+		// 同じドメイン内のリンクのみをクロール
+		parsedURL, err := url.Parse(absoluteURL)
+		if err != nil || parsedURL.Hostname() != baseDomain {
+			return
+		}
+
+		// 外部リソースのリンクをスキップ
+		if strings.HasSuffix(absoluteURL, ".pdf") || strings.HasSuffix(absoluteURL, ".zip") {
+			return
+		}
+
+		wg.Add(1)
+		go func(url string) {
+			defer wg.Done()
+			_ = c.crawlPage(url, depth+1, baseDomain)
+		}(absoluteURL)
+	})
+
+	wg.Wait()
+	return nil
+}
+
+// normalizeURL はURLを正規化する
+func normalizeURL(rawURL string) string {
+	// フラグメントを削除
+	if i := strings.Index(rawURL, "#"); i > 0 {
+		rawURL = rawURL[:i]
+	}
+	return rawURL
+}
+
+// resolveURL は相対URLを絶対URLに変換する
+func resolveURL(base, href string) (string, error) {
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+
+	refURL, err := url.Parse(href)
+	if err != nil {
+		return "", err
+	}
+
+	resolvedURL := baseURL.ResolveReference(refURL)
+	return resolvedURL.String(), nil
+}
+
+================
+File: internal/parser/parser.go
+================
+package parser
+
+import (
+	"strings"
+
+	"github.com/PuerkitoBio/goquery"
+)
+
+// ExtractMainContent はHTMLドキュメントからメインコンテンツを抽出する
+func ExtractMainContent(doc *goquery.Document) string {
+	var content strings.Builder
+
+	// メインコンテンツの可能性が高い要素のセレクタ
+	// これはサイトによって調整が必要
+	selectors := []string{
+		"main", "article", ".content", ".documentation", ".docs-content",
+		"#content", "#main-content", ".main-content", ".article-content",
+	}
+
+	for _, selector := range selectors {
+		selection := doc.Find(selector)
+		if selection.Length() > 0 {
+			// 見つかった最初の要素を使用
+			html, err := selection.First().Html()
+			if err == nil && len(html) > 0 {
+				return cleanHTML(html)
+			}
+		}
+	}
+
+	// 特定のセレクタが見つからない場合は、bodyコンテンツを使用
+	body := doc.Find("body")
+	if body.Length() > 0 {
+		html, err := body.Html()
+		if err == nil {
+			return cleanHTML(html)
+		}
+	}
+
+	// 最終手段としてHTMLドキュメント全体を返す
+	html, err := doc.Html()
+	if err == nil {
+		return cleanHTML(html)
+	}
+
+	return ""
+}
+
+// cleanHTML はHTMLをクリーンアップする
+func cleanHTML(html string) string {
+	// JavaScript部分を削除
+	html = removeElement(html, "<script", "</script>")
+
+	// CSSスタイルを削除
+	html = removeElement(html, "<style", "</style>")
+
+	// インラインスタイルを削除
+	html = removeAttribute(html, "style=\"", "\"")
+
+	// クラス属性を削除
+	html = removeAttribute(html, "class=\"", "\"")
+
+	// IDを削除
+	html = removeAttribute(html, "id=\"", "\"")
+
+	// データ属性を削除
+	html = removeDataAttributes(html)
+
+	// 連続する空白を単一の空白に置換
+	html = strings.Join(strings.Fields(html), " ")
+
+	return html
+}
+
+// removeElement はHTMLから特定の要素を削除する
+func removeElement(html, startTag, endTag string) string {
+	result := html
+	for {
+		startIdx := strings.Index(strings.ToLower(result), strings.ToLower(startTag))
+		if startIdx == -1 {
+			break
+		}
+
+		endIdx := strings.Index(strings.ToLower(result[startIdx:]), strings.ToLower(endTag))
+		if endIdx == -1 {
+			break
+		}
+
+		endIdx += startIdx + len(endTag)
+		if endIdx <= len(result) {
+			result = result[:startIdx] + result[endIdx:]
+		} else {
+			break
+		}
+	}
+	return result
+}
+
+// removeAttribute はHTML要素から特定の属性を削除する
+func removeAttribute(html, attrStart, attrEnd string) string {
+	result := html
+	for {
+		startIdx := strings.Index(strings.ToLower(result), strings.ToLower(attrStart))
+		if startIdx == -1 {
+			break
+		}
+
+		endIdx := strings.Index(result[startIdx:], attrEnd)
+		if endIdx == -1 {
+			break
+		}
+
+		endIdx += startIdx + len(attrEnd)
+		if endIdx <= len(result) {
+			result = result[:startIdx] + result[endIdx:]
+		} else {
+			break
+		}
+	}
+	return result
+}
+
+// removeDataAttributes はHTML要素からdata-*属性を削除する
+func removeDataAttributes(html string) string {
+	result := html
+	for {
+		startIdx := strings.Index(strings.ToLower(result), "data-")
+		if startIdx == -1 {
+			break
+		}
+
+		// data-属性の前にスペースがあるか確認
+		if startIdx > 0 && result[startIdx-1] != ' ' {
+			// 実際のdata-属性でない場合は次の候補を探す
+			result = result[startIdx+5:]
+			continue
+		}
+
+		// 属性値の終わりを見つける
+		endIdx := strings.Index(result[startIdx:], "\"")
+		if endIdx == -1 {
+			break
+		}
+
+		// 属性値を含む引用符の後の位置
+		valueEndIdx := strings.Index(result[startIdx+endIdx+1:], "\"")
+		if valueEndIdx == -1 {
+			break
+		}
+
+		endIdx = startIdx + endIdx + valueEndIdx + 2
+		if endIdx <= len(result) {
+			result = result[:startIdx] + result[endIdx:]
+		} else {
+			break
+		}
+	}
+	return result
+}
+
+================
+File: internal/pdf/generator.go
+================
+package pdf
+
+import (
+	"fmt"
+
+	"github.com/jung-kurt/gofpdf"
+	"github.com/yugo-ibuki/docrawl/internal/crawler"
+)
+
+// Generator はPDFを生成する構造体
+type Generator struct {
+	outputPath string
+}
+
+// NewGenerator は新しいGeneratorインスタンスを作成する
+func NewGenerator(outputPath string) *Generator {
+	return &Generator{
+		outputPath: outputPath,
+	}
+}
+
+// GeneratePDF はクロールしたページからPDFを生成する
+func (g *Generator) GeneratePDF(pages []crawler.Page) error {
+	if len(pages) == 0 {
+		return fmt.Errorf("PDFを生成するページがありません")
+	}
+
+	// PDFを作成
+	pdf := gofpdf.New("P", "mm", "A4", "")
+
+	// フォントを設定
+	pdf.AddUTF8Font("NotoSans", "", "")
+	pdf.SetFont("NotoSans", "", 11)
+
+	// 各ページについて
+	for _, page := range pages {
+		// 新しいPDFページを追加
+		pdf.AddPage()
+
+		// ヘッダー: ページタイトルとURL
+		pdf.SetFont("NotoSans", "B", 16)
+		pdf.CellFormat(190, 10, page.Title, "0", 1, "C", false, 0, "")
+
+		pdf.SetFont("NotoSans", "I", 8)
+		pdf.CellFormat(190, 5, page.URL, "0", 1, "C", false, 0, "")
+
+		pdf.Ln(10)
+
+		// 本文
+		pdf.SetFont("NotoSans", "", 11)
+		cleanText := cleanTextForPDF(page.Content)
+
+		// テキストの分割と改行処理
+		lines := splitTextIntoLines(cleanText, 80)
+		for _, line := range lines {
+			if line == "" {
+				pdf.Ln(5) // 空行の場合は行間を空ける
+			} else {
+				pdf.MultiCell(190, 5, line, "0", "L", false)
+			}
+		}
+
+		// ページ番号
+		pdf.SetY(-15)
+		pdf.SetFont("NotoSans", "I", 8)
+		pageNum := fmt.Sprintf("%d / %d", pdf.PageNo(), len(pages))
+		pdf.CellFormat(0, 10, pageNum, "0", 0, "C", false, 0, "")
+	}
+
+	// PDFを保存
+	return pdf.OutputFileAndClose(g.outputPath)
+}
+
+// cleanTextForPDF はPDFに表示するテキストをクリーンアップする
+func cleanTextForPDF(text string) string {
+	// HTMLタグの簡易的な除去（より高度な処理が必要な場合はHTMLパーサーを使用）
+	inTag := false
+	var result []rune
+
+	for _, r := range text {
+		if r == '<' {
+			inTag = true
+			continue
+		}
+		if r == '>' {
+			inTag = false
+			// タグの後に空白を挿入
+			result = append(result, ' ')
+			continue
+		}
+		if !inTag {
+			result = append(result, r)
+		}
+	}
+
+	return string(result)
+}
+
+// splitTextIntoLines はテキストを行に分割する
+func splitTextIntoLines(text string, maxChars int) []string {
+	var lines []string
+	var currentLine string
+
+	for _, r := range text {
+		currentLine += string(r)
+
+		// 改行文字の処理
+		if r == '\n' {
+			lines = append(lines, currentLine[:len(currentLine)-1])
+			currentLine = ""
+			continue
+		}
+
+		// 行の長さが最大文字数に達した場合
+		if len(currentLine) >= maxChars {
+			// 空白を探して分割
+			lastSpace := -1
+			for i := len(currentLine) - 1; i >= 0; i-- {
+				if currentLine[i] == ' ' {
+					lastSpace = i
+					break
+				}
+			}
+
+			if lastSpace > 0 {
+				lines = append(lines, currentLine[:lastSpace])
+				currentLine = currentLine[lastSpace+1:]
+			} else {
+				// 空白が見つからない場合は強制的に分割
+				lines = append(lines, currentLine)
+				currentLine = ""
+			}
+		}
+	}
+
+	// 残りのテキストを追加
+	if currentLine != "" {
+		lines = append(lines, currentLine)
+	}
+
+	return lines
+}
+
+================
+File: .gitignore
+================
+.idea
+
+================
+File: go.mod
+================
+module github.com/yugo-ibuki/docrawl
+
+go 1.24.0
+
+require (
+	github.com/PuerkitoBio/goquery v1.10.2 // indirect
+	github.com/andybalholm/cascadia v1.3.3 // indirect
+	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/jung-kurt/gofpdf v1.16.2 // indirect
+	github.com/spf13/cobra v1.9.1 // indirect
+	github.com/spf13/pflag v1.0.6 // indirect
+	golang.org/x/net v0.35.0 // indirect
+)
+
+================
+File: main.go
+================
+package cmd
+
+import (
+	"fmt"
+	"github.com/spf13/cobra"
+	"github.com/yugo-ibuki/docrawl/internal/crawler"
+	"github.com/yugo-ibuki/docrawl/internal/pdf"
+)
+
+var (
+	baseURL    string
+	outputPath string
+	maxDepth   int
+	timeout    int
+)
+
+var rootCmd = &cobra.Command{
+	Use:   "document-crawler",
+	Short: "ドキュメントサイトをクローリングしてPDFに変換するツール",
+	Long: `document-crawlerはドキュメントサイト全体をクローリングし、
+内容をPDFとして保存するCLIツールです。技術のライブラリのような
+ドキュメントサイトを対象としています。`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if baseURL == "" {
+			return fmt.Errorf("ベースURLを指定してください")
+		}
+
+		crawler := crawler.New(baseURL, maxDepth, timeout)
+		pages, err := crawler.Crawl()
+		if err != nil {
+			return err
+		}
+
+		generator := pdf.NewGenerator(outputPath)
+		if err := generator.GeneratePDF(pages); err != nil {
+			return err
+		}
+
+		fmt.Printf("成功: %s にPDFが生成されました\n", outputPath)
+		return nil
+	},
+}
+
+func Execute() error {
+	return rootCmd.Execute()
+}
+
+func init() {
+	rootCmd.Flags().StringVarP(&baseURL, "url", "u", "", "クローリング開始URLを指定 (必須)")
+	rootCmd.Flags().StringVarP(&outputPath, "output", "o", "output.pdf", "出力PDFファイルパス")
+	rootCmd.Flags().IntVarP(&maxDepth, "depth", "d", 3, "クローリングの最大深度")
+	rootCmd.Flags().IntVarP(&timeout, "timeout", "t", 30, "リクエストタイムアウト（秒）")
+
+	rootCmd.MarkFlagRequired("url")
+}
+
+================
+File: README.md
+================
+# docrawl
+
+技術ドキュメントサイトをクローリングしてPDF化するCLIツール
+
+## 概要
+
+docrawlは技術ライブラリなどのドキュメントサイト全体をクローリングし、その内容をPDFとして保存するCLIツールです。指定したURLから始めて、同一ドメイン内のページを再帰的にクロールし、整形されたPDFドキュメントを生成します。
+
+## インストール
+
+```bash
+go install github.com/yugo-ibuki/docrawl@latest
+```
+
+## 使い方
+
+### 基本的な使い方
+
+```bash
+docrawl --url https://example.com/docs
+```
+
+### オプション
+
+| オプション | 短縮形 | デフォルト値 | 説明 |
+|------------|--------|--------------|------|
+| `--url`    | `-u`   | (必須)       | クローリング開始URLを指定 |
+| `--output` | `-o`   | `output.pdf` | 出力PDFファイルパス |
+| `--depth`  | `-d`   | `3`          | クローリングの最大深度 |
+| `--timeout`| `-t`   | `30`         | リクエストタイムアウト（秒） |
+
+### 使用例
+
+```bash
+# 基本的な使用法
+docrawl -u https://example.com/docs
+
+# 出力ファイル名を指定
+docrawl -u https://example.com/docs -o example-docs.pdf
+
+# 最大深度を変更
+docrawl -u https://example.com/docs -d 5
+
+# タイムアウト時間を変更
+docrawl -u https://example.com/docs -t 60
+
+# すべてのオプションを指定
+docrawl -u https://example.com/docs -o example-docs.pdf -d 5 -t 60
+```
+
+## 機能
+
+- 指定されたURLからドキュメントサイト全体をクローリング
+- 同一ドメイン内のリンクのみを追跡
+- 最大クローリング深度の設定
+- PDFドキュメントへの変換
+- リクエストタイムアウトの設定
+- 並行クローリングによる高速な処理
+
+## 注意事項
+
+- 対象サイトのロボット排除規約を尊重してください
+- サイトへの過度な負荷を避けるため、適切なクローリング深度とタイムアウト設定を行ってください
+- 生成されたPDFは個人的な使用のみを目的としてください
+- 一部のウェブサイトではJavaScriptによるコンテンツレンダリングが行われるため、そのようなサイトでは適切にコンテンツが取得できない場合があります
+
+## ライセンス
+
+[MIT](LICENSE)
+
+
+
+================================================================
+End of Codebase
+================================================================
