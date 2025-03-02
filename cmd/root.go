@@ -8,10 +8,11 @@ import (
 )
 
 var (
-	baseURL    string
-	outputPath string
-	maxDepth   int
-	timeout    int
+	baseURL      string
+	outputPath   string
+	maxDepth     int
+	timeout      int
+	delaySeconds float64 // クローリング間の遅延（秒）
 )
 
 var rootCmd = &cobra.Command{
@@ -25,7 +26,7 @@ var rootCmd = &cobra.Command{
 			return fmt.Errorf("ベースURLを指定してください")
 		}
 
-		crawler := crawler.New(baseURL, maxDepth, timeout)
+		crawler := crawler.New(baseURL, maxDepth, timeout, delaySeconds)
 		pages, err := crawler.Crawl()
 		if err != nil {
 			return err
@@ -50,6 +51,7 @@ func init() {
 	rootCmd.Flags().StringVarP(&outputPath, "output", "o", "output.pdf", "出力PDFファイルパス")
 	rootCmd.Flags().IntVarP(&maxDepth, "depth", "d", 3, "クローリングの最大深度")
 	rootCmd.Flags().IntVarP(&timeout, "timeout", "t", 30, "リクエストタイムアウト（秒）")
+	rootCmd.Flags().Float64VarP(&delaySeconds, "delay", "w", 2.0, "リクエスト間の待機時間（秒）")
 
 	rootCmd.MarkFlagRequired("url")
 }

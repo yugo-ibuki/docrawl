@@ -25,6 +25,7 @@ type Crawler struct {
 	baseURL    string
 	maxDepth   int
 	timeout    int
+	delay      time.Duration // クローリング間の遅延
 	visited    map[string]bool
 	visitedMux sync.Mutex
 	pages      []Page
@@ -33,11 +34,12 @@ type Crawler struct {
 }
 
 // New は新しいCrawlerインスタンスを作成する
-func New(baseURL string, maxDepth, timeout int) *Crawler {
+func New(baseURL string, maxDepth, timeout int, delaySeconds float64) *Crawler {
 	return &Crawler{
 		baseURL:   baseURL,
 		maxDepth:  maxDepth,
 		timeout:   timeout,
+		delay:     time.Duration(delaySeconds * float64(time.Second)),
 		visited:   make(map[string]bool),
 		pages:     []Page{},
 		semaphore: make(chan struct{}, 5), // 同時に5つまでのリクエストを許可
@@ -96,7 +98,9 @@ func (c *Crawler) crawlPage(pageURL string, depth int, baseDomain string) error 
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "DocumentCrawler/1.0")
+
+	// 自然なブラウザリクエストのヘッダーを設定
+	setRequestHeaders(req)
 
 	// HTTPレスポンス
 	resp, err := client.Do(req)
@@ -192,4 +196,22 @@ func resolveURL(base, href string) (string, error) {
 
 	resolvedURL := baseURL.ResolveReference(refURL)
 	return resolvedURL.String(), nil
+}
+
+// setRequestHeaders はリクエストに一般的なブラウザのヘッダーを設定する
+func setRequestHeaders(req *http.Request) {
+	// 一般的なブラウザのユーザーエージェントを使用
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+
+	// 追加のヘッダーを設定して自然なブラウザリクエストに見せる
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+	req.Header.Set("Accept-Language", "ja,en-US;q=0.9,en;q=0.8")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Cache-Control", "max-age=0")
 }
