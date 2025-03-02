@@ -8,8 +8,6 @@ import (
 
 // ExtractMainContent はHTMLドキュメントからメインコンテンツを抽出する
 func ExtractMainContent(doc *goquery.Document) string {
-	var content strings.Builder
-
 	// メインコンテンツの可能性が高い要素のセレクタ
 	// これはサイトによって調整が必要
 	selectors := []string{
